@@ -1,35 +1,56 @@
-name: Build V8 Android ARM64 Sandbox PoC
+name: ANGLE Linux Debug, ASan, and UBSan (v4)
 
 on:
   workflow_dispatch:
     inputs:
-      v8_ref:
-        description: "V8 branch, tag, or full commit SHA"
+      angle_ref:
+        description: "ANGLE branch, tag, or commit SHA"
         required: true
-        default: "main"
+        default: "refs/heads/main"
         type: string
-  push:
-    paths:
-      - ".github/workflows/build-v8-android-arm64.yml"
+      symbol_level:
+        description: "Debug-symbol level (2 is best for security research)"
+        required: true
+        default: "2"
+        type: choice
+        options:
+          - "2"
+          - "1"
+      retention_days:
+        description: "Artifact retention period"
+        required: true
+        default: "7"
+        type: choice
+        options:
+          - "3"
+          - "7"
+          - "14"
+          - "30"
 
 permissions:
   contents: read
 
 concurrency:
-  group: v8-android-arm64-${{ github.ref }}
+  group: angle-linux-build
   cancel-in-progress: false
 
 env:
-  DEPOT_TOOLS: ${{ github.workspace }}/depot_tools
-  SRC_ROOT: ${{ github.workspace }}/v8-work
-  V8_DIR: ${{ github.workspace }}/v8-work/v8
-  OUT_DIR: ${{ github.workspace }}/v8-work/v8/out.gn/android-arm64-sandbox-poc
-  PACKAGE_ROOT: ${{ github.workspace }}/packages
-  V8_REF: ${{ inputs.v8_ref || 'main' }}
+  DEBIAN_FRONTEND: noninteractive
+  DEPOT_TOOLS_DIR: ${{ github.workspace }}/depot_tools
+  CHECKOUT_ROOT: ${{ github.workspace }}/checkout
+  # `fetch angle` checks ANGLE out directly into the current directory.
+  ANGLE_SRC: ${{ github.workspace }}/checkout
+  ARCHIVE_DIR: ${{ github.workspace }}/artifacts
+  LOG_DIR: ${{ github.workspace }}/build-logs
+  ANGLE_REF: ${{ inputs.angle_ref }}
+  SYMBOL_LEVEL: ${{ inputs.symbol_level }}
+  DEPOT_TOOLS_UPDATE: "0"
+  GCLIENT_PY3: "1"
+  NINJA_STATUS: "[%r processes, %f/%t @ %o/s, %es elapsed] "
 
 jobs:
   build:
-    name: Android ARM64 d8
+    name: Sequential Linux x64 builds
     runs-on: ubuntu-24.04
     timeout-minutes: 360
 
@@ -39,9 +60,10 @@ jobs:
         run: |
           set -euxo pipefail
           uname -a
-          nproc
+          lscpu
           free -h
           df -h
+          echo "CPU jobs: $(nproc --all)"
 
       - name: Reclaim runner disk space
         shell: bash
@@ -52,10 +74,8 @@ jobs:
             /usr/share/dotnet \
             /opt/ghc \
             /usr/local/.ghcup \
-            /usr/local/share/boost \
-            /usr/share/swift \
             /opt/hostedtoolcache/CodeQL || true
-          docker system prune --all --force --volumes || true
+          sudo docker system prune --all --force --volumes || true
           sudo apt-get clean
           df -h
 
@@ -64,314 +84,331 @@ jobs:
         run: |
           set -euxo pipefail
           sudo apt-get update
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            binutils \
+          sudo apt-get install --yes --no-install-recommends \
             ca-certificates \
             curl \
-            file \
             git \
-            jq \
             lsb-release \
-            ninja-build \
-            pkg-config \
+            p7zip-full \
             python3 \
-            python3-setuptools \
-            unzip \
-            xz-utils \
-            zip \
-            zstd
+            python3-pip \
+            xz-utils
+          sudo apt-get clean
 
-      - name: Install depot_tools
+      - name: Install and bootstrap depot_tools
         shell: bash
         run: |
           set -euxo pipefail
+
           git clone --depth=1 \
             https://chromium.googlesource.com/chromium/tools/depot_tools.git \
-            "$DEPOT_TOOLS"
-          echo "$DEPOT_TOOLS" >> "$GITHUB_PATH"
-          export PATH="$DEPOT_TOOLS:$PATH"
-          gclient --version
+            "$DEPOT_TOOLS_DIR"
 
-      - name: Check out V8 and Android dependencies
-        shell: bash
-        run: |
-          set -euxo pipefail
-          export PATH="$DEPOT_TOOLS:$PATH"
+          echo "$DEPOT_TOOLS_DIR" >> "$GITHUB_PATH"
+          export PATH="$DEPOT_TOOLS_DIR:$PATH"
 
-          mkdir -p "$SRC_ROOT"
-          git init "$V8_DIR"
-          git -C "$V8_DIR" remote add origin \
-            https://chromium.googlesource.com/v8/v8.git
-          git -C "$V8_DIR" fetch --depth=1 origin "$V8_REF"
-          git -C "$V8_DIR" checkout --detach FETCH_HEAD
+          # DEPOT_TOOLS_UPDATE=0 intentionally prevents depot_tools from
+          # changing revision during the job. It also disables automatic
+          # bootstrap, so initialize the bundled Python/CIPD tools explicitly.
+          "$DEPOT_TOOLS_DIR/ensure_bootstrap"
 
-          cat > "$SRC_ROOT/.gclient" <<'EOF'
-          solutions = [
-            {
-              "name": "v8",
-              "url": "https://chromium.googlesource.com/v8/v8.git",
-              "deps_file": "DEPS",
-              "managed": False,
-              "custom_deps": {},
-              "custom_vars": {},
-            },
-          ]
-          target_os = ["android", "unix"]
-          EOF
+          test -s "$DEPOT_TOOLS_DIR/python3_bin_reldir.txt"
+          test -x "$DEPOT_TOOLS_DIR/python-bin/python3"
 
-          cd "$SRC_ROOT"
-          gclient sync --nohooks --no-history --shallow -D
+          "$DEPOT_TOOLS_DIR/python-bin/python3" --version
+          command -v gclient
+          command -v autoninja
 
-          V8_COMMIT="$(git -C "$V8_DIR" rev-parse HEAD)"
-          V8_SHORT_SHA="$(git -C "$V8_DIR" rev-parse --short=12 HEAD)"
-          echo "V8_COMMIT=$V8_COMMIT" >> "$GITHUB_ENV"
-          echo "V8_SHORT_SHA=$V8_SHORT_SHA" >> "$GITHUB_ENV"
-          git -C "$V8_DIR" show -s --format=fuller HEAD
-          df -h
-
-      - name: Install V8 Linux and Android build dependencies
-        shell: bash
-        run: |
-          set -euxo pipefail
-          export PATH="$DEPOT_TOOLS:$PATH"
-          cd "$V8_DIR"
-          env DEBIAN_FRONTEND=noninteractive \
-            ./build/install-build-deps.sh --no-prompt
-          gclient runhooks
-          df -h
-
-      - name: Generate Android ARM64 sandbox build
-        shell: bash
-        run: |
-          set -euxo pipefail
-          export PATH="$DEPOT_TOOLS:$PATH"
-          cd "$V8_DIR"
-          mkdir -p "$OUT_DIR"
-
-          cat > "$OUT_DIR/args.gn" <<'EOF'
-          # Real Android ARM64 target, not an ARM64 simulator.
-          target_os = "android"
-          target_cpu = "arm64"
-          v8_target_cpu = "arm64"
-
-          # Release-like standalone d8 build with native symbols retained.
-          is_component_build = false
-          is_debug = false
-          is_official_build = false
-          dcheck_always_on = false
-          symbol_level = 2
-
-          # V8 sandbox and the official sandbox-testing corruption API.
-          v8_enable_pointer_compression = true
-          v8_enable_pointer_compression_shared_cage = true
-          v8_enable_external_code_space = true
-          v8_enable_sandbox = true
-          v8_enable_memory_corruption_api = true
-
-          # Send d8 output to stdout when running under Android/ADB.
-          v8_android_log_stdout = true
-
-          # Do not fail a security research build solely on new warnings.
-          treat_warnings_as_errors = false
-          EOF
-
-          gn gen "$OUT_DIR" --fail-on-unused-args
-          gn args "$OUT_DIR" --list --short | tee "$OUT_DIR/effective_gn_args.txt"
-
-          grep -F 'target_os = "android"' "$OUT_DIR/effective_gn_args.txt"
-          grep -F 'target_cpu = "arm64"' "$OUT_DIR/effective_gn_args.txt"
-          grep -F 'v8_target_cpu = "arm64"' "$OUT_DIR/effective_gn_args.txt"
-          grep -F 'is_debug = false' "$OUT_DIR/effective_gn_args.txt"
-          grep -F 'dcheck_always_on = false' "$OUT_DIR/effective_gn_args.txt"
-          grep -F 'v8_enable_sandbox = true' "$OUT_DIR/effective_gn_args.txt"
-          grep -F 'v8_enable_memory_corruption_api = true' "$OUT_DIR/effective_gn_args.txt"
-
-      - name: Build d8 with all runner CPUs
-        shell: bash
-        run: |
-          set -euxo pipefail
-          export PATH="$DEPOT_TOOLS:$PATH"
-          cd "$V8_DIR"
-          autoninja -C "$OUT_DIR" -j "$(nproc)" d8
-          df -h
-
-      - name: Verify binary and build configuration
-        shell: bash
-        run: |
-          set -euxo pipefail
-          export PATH="$DEPOT_TOOLS:$PATH"
-          cd "$V8_DIR"
-
-          test -x "$OUT_DIR/d8"
-          test -f "$OUT_DIR/v8_build_config.json"
-
-          file "$OUT_DIR/d8" | tee "$OUT_DIR/FILE.txt"
-          readelf -h "$OUT_DIR/d8" | tee "$OUT_DIR/ELF_HEADER.txt"
-          readelf -l "$OUT_DIR/d8" | tee "$OUT_DIR/PROGRAM_HEADERS.txt"
-
-          grep -q 'AArch64' "$OUT_DIR/ELF_HEADER.txt"
-
-          python3 - "$OUT_DIR/v8_build_config.json" <<'PY'
-          import json
-          import sys
-
-          path = sys.argv[1]
-          with open(path, "r", encoding="utf-8") as f:
-              cfg = json.load(f)
-
-          def enabled(key):
-              value = cfg.get(key)
-              return value is True or str(value).lower() == "true"
-
-          expected_true = [
-              "is_android",
-              "sandbox",
-              "memory_corruption_api",
-              "pointer_compression",
-              "pointer_compression_shared_cage",
-          ]
-          for key in expected_true:
-              if not enabled(key):
-                  raise SystemExit(f"Expected {key}=true, got {cfg.get(key)!r}")
-
-          if cfg.get("arch") != "arm64":
-              raise SystemExit(f"Expected arch=arm64, got {cfg.get('arch')!r}")
-          if cfg.get("target_cpu") != "arm64":
-              raise SystemExit(
-                  f"Expected target_cpu=arm64, got {cfg.get('target_cpu')!r}"
-              )
-          if enabled("simulator_run"):
-              raise SystemExit("This is unexpectedly a simulator build")
-          if enabled("dcheck_always_on"):
-              raise SystemExit("Primary build unexpectedly has DCHECKs always on")
-
-          print(json.dumps(cfg, indent=2, sort_keys=True))
-          PY
-
-      - name: Package runtime and symbols
-        shell: bash
-        run: |
-          set -euxo pipefail
-          export PATH="$DEPOT_TOOLS:$PATH"
-          cd "$V8_DIR"
-
-          RUNTIME_DIR="$PACKAGE_ROOT/v8-android-arm64-sandbox-poc"
-          SYMBOLS_DIR="$PACKAGE_ROOT/v8-android-arm64-sandbox-poc-symbols"
-          mkdir -p "$RUNTIME_DIR" "$SYMBOLS_DIR"
-
-          install -m 0755 "$OUT_DIR/d8" "$RUNTIME_DIR/d8"
-          for name in icudtl.dat snapshot_blob.bin v8_build_config.json \
-                      v8_features.json effective_gn_args.txt FILE.txt \
-                      ELF_HEADER.txt PROGRAM_HEADERS.txt; do
-            if [[ -f "$OUT_DIR/$name" ]]; then
-              install -m 0644 "$OUT_DIR/$name" "$RUNTIME_DIR/$name"
-            fi
-          done
-          install -m 0644 "$OUT_DIR/args.gn" "$RUNTIME_DIR/args.gn"
-
-          if [[ -f "$OUT_DIR/exe.unstripped/d8" ]]; then
-            install -m 0755 "$OUT_DIR/exe.unstripped/d8" \
-              "$SYMBOLS_DIR/d8.unstripped"
-          else
-            echo "No exe.unstripped/d8 was produced" > "$SYMBOLS_DIR/NOTICE.txt"
-          fi
-
-          git rev-parse HEAD > "$RUNTIME_DIR/V8_COMMIT.txt"
-          git show -s --format=fuller HEAD > "$RUNTIME_DIR/V8_COMMIT_DETAILS.txt"
-          cp "$RUNTIME_DIR/V8_COMMIT.txt" "$SYMBOLS_DIR/V8_COMMIT.txt"
-          cp "$OUT_DIR/args.gn" "$SYMBOLS_DIR/args.gn"
-
-          gn desc "$OUT_DIR" //:d8 runtime_deps --all \
-            > "$RUNTIME_DIR/runtime_deps_from_gn.txt" || true
-
-          cat > "$RUNTIME_DIR/verify-sandbox.js" <<'EOF'
-          'use strict';
-
-          print('Sandbox API type: ' + typeof Sandbox);
-          if (typeof Sandbox !== 'object') {
-            throw new Error('Sandbox testing API is unavailable');
-          }
-
-          print('Sandbox base: 0x' + Sandbox.base.toString(16));
-          const view = new Sandbox.MemoryView(0, 0x1000);
-          print('Sandbox.MemoryView length: 0x' + view.byteLength.toString(16));
-          print('Android ARM64 sandbox-testing build is ready.');
-          EOF
-
-          cat > "$RUNTIME_DIR/run-sandbox-poc.sh" <<'EOF'
-          #!/system/bin/sh
-          set -eu
-          cd "$(dirname "$0")"
-          exec ./d8 \
-            --run-as-sandbox-security-poc \
-            --sandbox-prohibit-insecure-mode \
-            "$@"
-          EOF
-          chmod 0755 "$RUNTIME_DIR/run-sandbox-poc.sh"
+          # Do not execute depot_tools/gn yet. It is only a dispatcher and
+          # requires ANGLE's real GN binary, downloaded later by gclient sync.
+          test -x "$DEPOT_TOOLS_DIR/gn"
 
           {
-            echo "V8 Android ARM64 Sandbox PoC build"
-            echo "V8 commit: $V8_COMMIT"
-            echo "V8 ref requested: $V8_REF"
-            echo "GitHub run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
-            echo "Runner: $RUNNER_NAME"
-            echo "Runner OS: $RUNNER_OS $RUNNER_ARCH"
-            echo "Build CPUs: $(nproc)"
+            echo "depot_tools commit: $(git -C "$DEPOT_TOOLS_DIR" rev-parse HEAD)"
+            echo "python3_bin_reldir: $(cat "$DEPOT_TOOLS_DIR/python3_bin_reldir.txt")"
+            echo "gclient: $(command -v gclient)"
+            echo "autoninja: $(command -v autoninja)"
+            echo "depot_tools GN dispatcher: $DEPOT_TOOLS_DIR/gn"
+          } | tee "$RUNNER_TEMP/depot-tools-bootstrap.txt"
+
+      - name: Fetch latest requested ANGLE revision
+        id: source
+        shell: bash
+        run: |
+          set -euxo pipefail
+          export PATH="$DEPOT_TOOLS_DIR:$PATH"
+
+          mkdir -p "$CHECKOUT_ROOT" "$ARCHIVE_DIR" "$LOG_DIR"
+          cd "$ANGLE_SRC"
+          fetch --nohooks angle
+
+          # `fetch angle` uses a gclient solution named ".", so the repository
+          # is the checkout directory itself, not a nested checkout/angle path.
+          test -d "$ANGLE_SRC/.git"
+          test -f "$ANGLE_SRC/DEPS"
+          echo "ANGLE source root: $ANGLE_SRC"
+          gclient root
+          git status --short
+
+          git fetch --force origin "$ANGLE_REF"
+          git checkout --detach FETCH_HEAD
+
+          # Record the resolved source revision before long dependency setup so
+          # diagnostics and failure artifacts still carry the exact commit.
+          commit="$(git rev-parse HEAD)"
+          short_commit="$(git rev-parse --short=12 HEAD)"
+          commit_time="$(git show -s --format=%cI HEAD)"
+          subject="$(git show -s --format=%s HEAD)"
+
+          {
+            echo "commit=$commit"
+            echo "short_commit=$short_commit"
+            echo "commit_time=$commit_time"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "ANGLE_COMMIT=$commit"
+            echo "ANGLE_SHORT_COMMIT=$short_commit"
+            echo "ANGLE_COMMIT_TIME=$commit_time"
+          } >> "$GITHUB_ENV"
+
+          gclient sync \
+            --nohooks \
+            --delete_unversioned_trees \
+            --force
+
+          # depot_tools/gn is a dispatcher. The actual GN executable belongs
+          # to the ANGLE checkout and is installed by the no-hooks sync above.
+          # Put the real binary first so hooks such as configure_siso.py can
+          # execute `gn --version` without recursing into the dispatcher.
+          GN_DIR="$ANGLE_SRC/buildtools/linux64"
+          GN_BIN="$GN_DIR/gn"
+          test -x "$GN_BIN"
+          export PATH="$GN_DIR:$DEPOT_TOOLS_DIR:$PATH"
+          echo "$GN_DIR" >> "$GITHUB_PATH"
+          echo "GN_BIN=$GN_BIN" >> "$GITHUB_ENV"
+
+          echo "Real ANGLE GN: $GN_BIN"
+          "$GN_BIN" --version
+          which -a gn || true
+
+          ./build/install-build-deps.sh --no-prompt --no-syms
+          gclient runhooks
+
+          # Fail here with a focused diagnostic rather than much later in GN.
+          test -s "$DEPOT_TOOLS_DIR/python3_bin_reldir.txt"
+          test -x "$DEPOT_TOOLS_DIR/python-bin/python3"
+          test -x "$GN_BIN"
+          "$GN_BIN" --version
+          gn --version
+          autoninja --version
+
+          {
+            echo "## ANGLE source"
             echo
-            file "$OUT_DIR/d8"
-            readelf -l "$OUT_DIR/d8" | grep -F 'Requesting program interpreter' || true
-          } > "$RUNTIME_DIR/BUILD_INFO.txt"
+            echo "- Ref requested: \`$ANGLE_REF\`"
+            echo "- Commit: \`$commit\`"
+            echo "- Commit time: \`$commit_time\`"
+            echo "- Subject: $subject"
+            echo "- Runner CPUs: \`$(nproc --all)\`"
+          } >> "$GITHUB_STEP_SUMMARY"
 
-          (
-            cd "$RUNTIME_DIR"
-            sha256sum * > SHA256SUMS.txt
+          git status --short
+          df -h
+
+      - name: Create sequential build helper
+        shell: bash
+        run: |
+          cat > "$RUNNER_TEMP/build-angle-config.sh" <<'SCRIPT'
+          #!/usr/bin/env bash
+          set -Eeuo pipefail
+
+          config="${1:?usage: build-angle-config.sh <debug|asan|ubsan>}"
+          jobs="$(nproc --all)"
+          gn_bin="${GN_BIN:-$ANGLE_SRC/buildtools/linux64/gn}"
+          test -x "$gn_bin"
+          out_rel="out/$config"
+          out_dir="$ANGLE_SRC/$out_rel"
+          archive="$ARCHIVE_DIR/angle-${config}-linux-x64-${ANGLE_SHORT_COMMIT}.zip"
+          log_file="$LOG_DIR/${config}.log"
+          args_file="$LOG_DIR/${config}.args.gn"
+
+          common_args=$(cat <<EOF
+          target_cpu = "x64"
+          is_component_build = false
+          is_official_build = false
+          use_remoteexec = false
+          use_siso = false
+          symbol_level = ${SYMBOL_LEVEL}
+          EOF
           )
-          (
-            cd "$SYMBOLS_DIR"
-            sha256sum * > SHA256SUMS.txt
-          )
 
-          cd "$PACKAGE_ROOT"
-          tar --zstd -cf \
-            "$GITHUB_WORKSPACE/v8-android-arm64-sandbox-poc-${V8_SHORT_SHA}.tar.zst" \
-            "$(basename "$RUNTIME_DIR")"
-          tar --zstd -cf \
-            "$GITHUB_WORKSPACE/v8-android-arm64-sandbox-poc-symbols-${V8_SHORT_SHA}.tar.zst" \
-            "$(basename "$SYMBOLS_DIR")"
+          case "$config" in
+            debug)
+              gn_args=$(cat <<EOF
+          ${common_args}
+          is_debug = true
+          angle_assert_always_on = true
+          dcheck_always_on = true
+          EOF
+              )
+              ;;
+            asan)
+              gn_args=$(cat <<EOF
+          ${common_args}
+          is_debug = false
+          is_asan = true
+          angle_assert_always_on = true
+          dcheck_always_on = true
+          EOF
+              )
+              ;;
+            ubsan)
+              gn_args=$(cat <<EOF
+          ${common_args}
+          is_debug = false
+          is_ubsan = true
+          is_ubsan_no_recover = true
+          angle_assert_always_on = true
+          dcheck_always_on = true
+          EOF
+              )
+              ;;
+            *)
+              echo "Unknown configuration: $config" >&2
+              exit 2
+              ;;
+          esac
 
-          cd "$GITHUB_WORKSPACE"
-          sha256sum \
-            "v8-android-arm64-sandbox-poc-${V8_SHORT_SHA}.tar.zst" \
-            "v8-android-arm64-sandbox-poc-symbols-${V8_SHORT_SHA}.tar.zst" \
-            > ARTIFACT_SHA256SUMS.txt
+          mkdir -p "$out_dir" "$ARCHIVE_DIR" "$LOG_DIR"
+          printf '%s\n' "$gn_args" > "$args_file"
 
-          ls -lh *.tar.zst ARTIFACT_SHA256SUMS.txt
+          {
+            echo "===== ANGLE $config configuration ====="
+            echo "Commit: $ANGLE_COMMIT"
+            echo "Jobs: $jobs"
+            echo "Output: $out_dir"
+            echo
+            echo "$gn_args"
+          } | tee "$log_file"
 
-      - name: Upload d8 build artifacts
-        uses: actions/upload-artifact@v4
+          cd "$ANGLE_SRC"
+
+          "$gn_bin" gen "$out_rel" --args="$gn_args" 2>&1 | tee -a "$log_file"
+          "$gn_bin" args "$out_rel" --list > "$out_dir/GN_ARGS_EXPANDED.txt"
+
+          autoninja -C "$out_rel" -j "$jobs" 2>&1 | tee -a "$log_file"
+
+          test -s "$out_dir/libEGL.so"
+          test -s "$out_dir/libGLESv2.so"
+
+          cat > "$out_dir/BUILD_INFO.txt" <<EOF
+          ANGLE commit: $ANGLE_COMMIT
+          ANGLE commit time: $ANGLE_COMMIT_TIME
+          GN binary: $gn_bin
+          GN version: $($gn_bin --version)
+          Configuration: $config
+          Target OS: linux
+          Target CPU: x64
+          Parallel jobs: $jobs
+          Runner: ${RUNNER_NAME:-unknown}
+          Runner OS: ${RUNNER_OS:-unknown}
+          Runner architecture: ${RUNNER_ARCH:-unknown}
+          Built UTC: $(date -u +%Y-%m-%dT%H:%M:%SZ)
+          EOF
+
+          find "$out_dir" -maxdepth 1 -type f -printf '%f\t%s bytes\n' \
+            | sort > "$out_dir/TOP_LEVEL_FILES.txt"
+
+          rm -f "$archive" "$archive.sha256"
+          7z a -tzip -mx=1 -mmt=on "$archive" "$out_rel"
+          sha256sum "$archive" | tee "$archive.sha256"
+
+          archive_size="$(du -h "$archive" | cut -f1)"
+          {
+            echo
+            echo "### ${config^^}"
+            echo
+            echo "- Archive: \`$(basename "$archive")\`"
+            echo "- Size: \`$archive_size\`"
+            echo "- SHA-256: \`$(cut -d' ' -f1 "$archive.sha256")\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          rm -rf "$out_dir"
+          df -h
+          SCRIPT
+
+          chmod +x "$RUNNER_TEMP/build-angle-config.sh"
+
+      - name: Build and package Debug
+        shell: bash
+        run: "$RUNNER_TEMP/build-angle-config.sh debug"
+
+      - name: Upload Debug build
+        uses: actions/upload-artifact@v7
         with:
-          name: v8-android-arm64-sandbox-poc-${{ env.V8_SHORT_SHA }}
+          name: angle-debug-linux-x64-${{ steps.source.outputs.short_commit }}
           path: |
-            v8-android-arm64-sandbox-poc-${{ env.V8_SHORT_SHA }}.tar.zst
-            v8-android-arm64-sandbox-poc-symbols-${{ env.V8_SHORT_SHA }}.tar.zst
-            ARTIFACT_SHA256SUMS.txt
+            ${{ env.ARCHIVE_DIR }}/angle-debug-linux-x64-${{ steps.source.outputs.short_commit }}.zip
+            ${{ env.ARCHIVE_DIR }}/angle-debug-linux-x64-${{ steps.source.outputs.short_commit }}.zip.sha256
           if-no-files-found: error
           compression-level: 0
-          retention-days: 14
+          retention-days: ${{ inputs.retention_days }}
 
-      - name: Write job summary
+      - name: Remove uploaded Debug package
+        if: always()
         shell: bash
-        run: |
-          {
-            echo "## V8 Android ARM64 sandbox PoC build"
-            echo
-            echo "- Commit: \`$V8_COMMIT\`"
-            echo "- Requested ref: \`$V8_REF\`"
-            echo "- Target: \`android/arm64\`"
-            echo "- Sandbox: enabled"
-            echo "- Memory corruption API: enabled"
-            echo "- DCHECK always on: disabled"
-            echo "- Artifact: \`v8-android-arm64-sandbox-poc-$V8_SHORT_SHA\`"
-            echo
-            echo "The binary targets Android/Bionic and cannot be executed directly on the x64 GitHub runner."
-          } >> "$GITHUB_STEP_SUMMARY"
+        run: rm -f "$ARCHIVE_DIR"/angle-debug-linux-x64-*.zip*
+
+      - name: Build and package ASan
+        shell: bash
+        run: "$RUNNER_TEMP/build-angle-config.sh asan"
+
+      - name: Upload ASan build
+        uses: actions/upload-artifact@v7
+        with:
+          name: angle-asan-linux-x64-${{ steps.source.outputs.short_commit }}
+          path: |
+            ${{ env.ARCHIVE_DIR }}/angle-asan-linux-x64-${{ steps.source.outputs.short_commit }}.zip
+            ${{ env.ARCHIVE_DIR }}/angle-asan-linux-x64-${{ steps.source.outputs.short_commit }}.zip.sha256
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: ${{ inputs.retention_days }}
+
+      - name: Remove uploaded ASan package
+        if: always()
+        shell: bash
+        run: rm -f "$ARCHIVE_DIR"/angle-asan-linux-x64-*.zip*
+
+      - name: Build and package UBSan
+        shell: bash
+        run: "$RUNNER_TEMP/build-angle-config.sh ubsan"
+
+      - name: Upload UBSan build
+        uses: actions/upload-artifact@v7
+        with:
+          name: angle-ubsan-linux-x64-${{ steps.source.outputs.short_commit }}
+          path: |
+            ${{ env.ARCHIVE_DIR }}/angle-ubsan-linux-x64-${{ steps.source.outputs.short_commit }}.zip
+            ${{ env.ARCHIVE_DIR }}/angle-ubsan-linux-x64-${{ steps.source.outputs.short_commit }}.zip.sha256
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: ${{ inputs.retention_days }}
+
+      - name: Remove uploaded UBSan package
+        if: always()
+        shell: bash
+        run: rm -f "$ARCHIVE_DIR"/angle-ubsan-linux-x64-*.zip*
+
+      - name: Upload build logs and resolved GN arguments
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: angle-build-logs-${{ steps.source.outputs.short_commit || github.run_id }}
+          path: |
+            ${{ env.LOG_DIR }}
+            ${{ runner.temp }}/depot-tools-bootstrap.txt
+          if-no-files-found: warn
+          compression-level: 6
+          retention-days: ${{ inputs.retention_days }}
+          
