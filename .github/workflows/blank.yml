@@ -1,58 +1,37 @@
-name: ANGLE Linux Debug, ASan, and UBSan (v4)
+name: Build V8 Android ARM64 ASan Sandbox PoC
 
 on:
   workflow_dispatch:
     inputs:
-      angle_ref:
-        description: "ANGLE branch, tag, or commit SHA"
+      v8_ref:
+        description: "V8 branch, tag, or full commit SHA"
         required: true
-        default: "refs/heads/main"
+        default: "main"
         type: string
-      symbol_level:
-        description: "Debug-symbol level (2 is best for security research)"
-        required: true
-        default: "2"
-        type: choice
-        options:
-          - "2"
-          - "1"
-      retention_days:
-        description: "Artifact retention period"
-        required: true
-        default: "7"
-        type: choice
-        options:
-          - "3"
-          - "7"
-          - "14"
-          - "30"
+  push:
+    paths:
+      - ".github/workflows/build-v8-android-arm64-asan.yml"
 
 permissions:
   contents: read
 
 concurrency:
-  group: angle-linux-build
+  group: v8-android-arm64-asan-${{ github.ref }}
   cancel-in-progress: false
 
 env:
-  DEBIAN_FRONTEND: noninteractive
-  DEPOT_TOOLS_DIR: ${{ github.workspace }}/depot_tools
-  CHECKOUT_ROOT: ${{ github.workspace }}/checkout
-  # `fetch angle` checks ANGLE out directly into the current directory.
-  ANGLE_SRC: ${{ github.workspace }}/checkout
-  ARCHIVE_DIR: ${{ github.workspace }}/artifacts
-  LOG_DIR: ${{ github.workspace }}/build-logs
-  ANGLE_REF: ${{ inputs.angle_ref }}
-  SYMBOL_LEVEL: ${{ inputs.symbol_level }}
-  DEPOT_TOOLS_UPDATE: "0"
-  GCLIENT_PY3: "1"
-  NINJA_STATUS: "[%r processes, %f/%t @ %o/s, %es elapsed] "
+  DEPOT_TOOLS: ${{ github.workspace }}/depot_tools
+  SRC_ROOT: ${{ github.workspace }}/v8-work
+  V8_DIR: ${{ github.workspace }}/v8-work/v8
+  OUT_DIR: ${{ github.workspace }}/v8-work/v8/out.gn/android-arm64-sandbox-asan
+  PACKAGE_ROOT: ${{ github.workspace }}/packages
+  V8_REF: ${{ inputs.v8_ref || 'main' }}
 
 jobs:
   build:
-    name: Sequential Linux x64 builds
+    name: Android ARM64 ASan d8
     runs-on: ubuntu-24.04
-    timeout-minutes: 360
+    timeout-minutes: 420
 
     steps:
       - name: Show runner resources
@@ -60,10 +39,9 @@ jobs:
         run: |
           set -euxo pipefail
           uname -a
-          lscpu
+          nproc
           free -h
           df -h
-          echo "CPU jobs: $(nproc --all)"
 
       - name: Reclaim runner disk space
         shell: bash
@@ -74,8 +52,10 @@ jobs:
             /usr/share/dotnet \
             /opt/ghc \
             /usr/local/.ghcup \
+            /usr/local/share/boost \
+            /usr/share/swift \
             /opt/hostedtoolcache/CodeQL || true
-          sudo docker system prune --all --force --volumes || true
+          docker system prune --all --force --volumes || true
           sudo apt-get clean
           df -h
 
@@ -84,331 +64,481 @@ jobs:
         run: |
           set -euxo pipefail
           sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends \
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            binutils \
             ca-certificates \
             curl \
+            file \
             git \
+            jq \
             lsb-release \
-            p7zip-full \
+            ninja-build \
+            pkg-config \
             python3 \
-            python3-pip \
-            xz-utils
-          sudo apt-get clean
+            python3-setuptools \
+            unzip \
+            xz-utils \
+            zip \
+            zstd
 
-      - name: Install and bootstrap depot_tools
+      - name: Install depot_tools
         shell: bash
         run: |
           set -euxo pipefail
-
           git clone --depth=1 \
             https://chromium.googlesource.com/chromium/tools/depot_tools.git \
-            "$DEPOT_TOOLS_DIR"
+            "$DEPOT_TOOLS"
+          echo "$DEPOT_TOOLS" >> "$GITHUB_PATH"
+          export PATH="$DEPOT_TOOLS:$PATH"
+          gclient --version
 
-          echo "$DEPOT_TOOLS_DIR" >> "$GITHUB_PATH"
-          export PATH="$DEPOT_TOOLS_DIR:$PATH"
-
-          # DEPOT_TOOLS_UPDATE=0 intentionally prevents depot_tools from
-          # changing revision during the job. It also disables automatic
-          # bootstrap, so initialize the bundled Python/CIPD tools explicitly.
-          "$DEPOT_TOOLS_DIR/ensure_bootstrap"
-
-          test -s "$DEPOT_TOOLS_DIR/python3_bin_reldir.txt"
-          test -x "$DEPOT_TOOLS_DIR/python-bin/python3"
-
-          "$DEPOT_TOOLS_DIR/python-bin/python3" --version
-          command -v gclient
-          command -v autoninja
-
-          # Do not execute depot_tools/gn yet. It is only a dispatcher and
-          # requires ANGLE's real GN binary, downloaded later by gclient sync.
-          test -x "$DEPOT_TOOLS_DIR/gn"
-
-          {
-            echo "depot_tools commit: $(git -C "$DEPOT_TOOLS_DIR" rev-parse HEAD)"
-            echo "python3_bin_reldir: $(cat "$DEPOT_TOOLS_DIR/python3_bin_reldir.txt")"
-            echo "gclient: $(command -v gclient)"
-            echo "autoninja: $(command -v autoninja)"
-            echo "depot_tools GN dispatcher: $DEPOT_TOOLS_DIR/gn"
-          } | tee "$RUNNER_TEMP/depot-tools-bootstrap.txt"
-
-      - name: Fetch latest requested ANGLE revision
-        id: source
+      - name: Check out V8 and Android dependencies
         shell: bash
         run: |
           set -euxo pipefail
-          export PATH="$DEPOT_TOOLS_DIR:$PATH"
+          export PATH="$DEPOT_TOOLS:$PATH"
 
-          mkdir -p "$CHECKOUT_ROOT" "$ARCHIVE_DIR" "$LOG_DIR"
-          cd "$ANGLE_SRC"
-          fetch --nohooks angle
+          mkdir -p "$SRC_ROOT"
+          git init "$V8_DIR"
+          git -C "$V8_DIR" remote add origin \
+            https://chromium.googlesource.com/v8/v8.git
+          git -C "$V8_DIR" fetch --depth=1 origin "$V8_REF"
+          git -C "$V8_DIR" checkout --detach FETCH_HEAD
 
-          # `fetch angle` uses a gclient solution named ".", so the repository
-          # is the checkout directory itself, not a nested checkout/angle path.
-          test -d "$ANGLE_SRC/.git"
-          test -f "$ANGLE_SRC/DEPS"
-          echo "ANGLE source root: $ANGLE_SRC"
-          gclient root
-          git status --short
+          cat > "$SRC_ROOT/.gclient" <<'EOF'
+          solutions = [
+            {
+              "name": "v8",
+              "url": "https://chromium.googlesource.com/v8/v8.git",
+              "deps_file": "DEPS",
+              "managed": False,
+              "custom_deps": {},
+              "custom_vars": {},
+            },
+          ]
+          target_os = ["android", "unix"]
+          EOF
 
-          git fetch --force origin "$ANGLE_REF"
-          git checkout --detach FETCH_HEAD
+          cd "$SRC_ROOT"
+          gclient sync --nohooks --no-history --shallow -D
 
-          # Record the resolved source revision before long dependency setup so
-          # diagnostics and failure artifacts still carry the exact commit.
-          commit="$(git rev-parse HEAD)"
-          short_commit="$(git rev-parse --short=12 HEAD)"
-          commit_time="$(git show -s --format=%cI HEAD)"
-          subject="$(git show -s --format=%s HEAD)"
-
-          {
-            echo "commit=$commit"
-            echo "short_commit=$short_commit"
-            echo "commit_time=$commit_time"
-          } >> "$GITHUB_OUTPUT"
-
-          {
-            echo "ANGLE_COMMIT=$commit"
-            echo "ANGLE_SHORT_COMMIT=$short_commit"
-            echo "ANGLE_COMMIT_TIME=$commit_time"
-          } >> "$GITHUB_ENV"
-
-          gclient sync \
-            --nohooks \
-            --delete_unversioned_trees \
-            --force
-
-          # depot_tools/gn is a dispatcher. The actual GN executable belongs
-          # to the ANGLE checkout and is installed by the no-hooks sync above.
-          # Put the real binary first so hooks such as configure_siso.py can
-          # execute `gn --version` without recursing into the dispatcher.
-          GN_DIR="$ANGLE_SRC/buildtools/linux64"
-          GN_BIN="$GN_DIR/gn"
-          test -x "$GN_BIN"
-          export PATH="$GN_DIR:$DEPOT_TOOLS_DIR:$PATH"
-          echo "$GN_DIR" >> "$GITHUB_PATH"
-          echo "GN_BIN=$GN_BIN" >> "$GITHUB_ENV"
-
-          echo "Real ANGLE GN: $GN_BIN"
-          "$GN_BIN" --version
-          which -a gn || true
-
-          ./build/install-build-deps.sh --no-prompt --no-syms
-          gclient runhooks
-
-          # Fail here with a focused diagnostic rather than much later in GN.
-          test -s "$DEPOT_TOOLS_DIR/python3_bin_reldir.txt"
-          test -x "$DEPOT_TOOLS_DIR/python-bin/python3"
-          test -x "$GN_BIN"
-          "$GN_BIN" --version
-          gn --version
-          autoninja --version
-
-          {
-            echo "## ANGLE source"
-            echo
-            echo "- Ref requested: \`$ANGLE_REF\`"
-            echo "- Commit: \`$commit\`"
-            echo "- Commit time: \`$commit_time\`"
-            echo "- Subject: $subject"
-            echo "- Runner CPUs: \`$(nproc --all)\`"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-          git status --short
+          V8_COMMIT="$(git -C "$V8_DIR" rev-parse HEAD)"
+          V8_SHORT_SHA="$(git -C "$V8_DIR" rev-parse --short=12 HEAD)"
+          echo "V8_COMMIT=$V8_COMMIT" >> "$GITHUB_ENV"
+          echo "V8_SHORT_SHA=$V8_SHORT_SHA" >> "$GITHUB_ENV"
+          git -C "$V8_DIR" show -s --format=fuller HEAD
           df -h
 
-      - name: Create sequential build helper
+      - name: Install V8 Linux and Android build dependencies
         shell: bash
         run: |
-          cat > "$RUNNER_TEMP/build-angle-config.sh" <<'SCRIPT'
-          #!/usr/bin/env bash
-          set -Eeuo pipefail
+          set -euxo pipefail
+          export PATH="$DEPOT_TOOLS:$PATH"
+          cd "$V8_DIR"
+          env DEBIAN_FRONTEND=noninteractive \
+            ./build/install-build-deps.sh --no-prompt
+          gclient runhooks
+          df -h
 
-          config="${1:?usage: build-angle-config.sh <debug|asan|ubsan>}"
-          jobs="$(nproc --all)"
-          gn_bin="${GN_BIN:-$ANGLE_SRC/buildtools/linux64/gn}"
-          test -x "$gn_bin"
-          out_rel="out/$config"
-          out_dir="$ANGLE_SRC/$out_rel"
-          archive="$ARCHIVE_DIR/angle-${config}-linux-x64-${ANGLE_SHORT_COMMIT}.zip"
-          log_file="$LOG_DIR/${config}.log"
-          args_file="$LOG_DIR/${config}.args.gn"
+      - name: Select safe parallelism
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CPUS="$(nproc)"
+          MEM_GIB="$(awk '/MemTotal/ {print int($2 / 1024 / 1024)}' /proc/meminfo)"
+          JOBS_BY_MEM=$(( MEM_GIB / 3 ))
+          if (( JOBS_BY_MEM < 2 )); then JOBS_BY_MEM=2; fi
+          if (( CPUS < JOBS_BY_MEM )); then
+            BUILD_JOBS="$CPUS"
+          else
+            BUILD_JOBS="$JOBS_BY_MEM"
+          fi
+          echo "BUILD_JOBS=$BUILD_JOBS" >> "$GITHUB_ENV"
+          echo "Using $BUILD_JOBS build jobs ($CPUS CPUs, ${MEM_GIB} GiB RAM)"
 
-          common_args=$(cat <<EOF
-          target_cpu = "x64"
+      - name: Generate Android ARM64 ASan sandbox build
+        shell: bash
+        run: |
+          set -euxo pipefail
+          export PATH="$DEPOT_TOOLS:$PATH"
+          cd "$V8_DIR"
+          mkdir -p "$OUT_DIR"
+
+          cat > "$OUT_DIR/args.gn" <<'EOF'
+          # Real Android ARM64 target, not the ARM64 simulator.
+          target_os = "android"
+          target_cpu = "arm64"
+          v8_target_cpu = "arm64"
+
+          # Release-mode standalone d8 with detailed native symbols.
           is_component_build = false
+          is_debug = false
           is_official_build = false
-          use_remoteexec = false
-          use_siso = false
-          symbol_level = ${SYMBOL_LEVEL}
+          dcheck_always_on = false
+          symbol_level = 2
+
+          # Classic AddressSanitizer. Chromium currently warns that classic
+          # Android ASan is unsupported and recommends is_hwasan=true instead.
+          is_asan = true
+          is_lsan = false
+
+          # Android's supported production sandbox geometry plus the official
+          # memory-corruption API used by V8 sandbox security PoCs.
+          v8_enable_pointer_compression = true
+          v8_enable_pointer_compression_shared_cage = true
+          v8_enable_external_code_space = true
+          v8_enable_sandbox = true
+          v8_enable_memory_corruption_api = true
+
+          # Keep the main build release-like rather than DCHECK/debug based.
+          v8_enable_slow_dchecks = false
+          v8_enable_verify_heap = false
+
+          # Route d8 output to stdout under Android/ADB.
+          v8_android_log_stdout = true
+
+          # Do not fail research builds solely because a new warning landed.
+          treat_warnings_as_errors = false
           EOF
+
+          # GN currently emits an expected warning that is_asan on Android is
+          # unsupported. It does not reject the build.
+          gn gen "$OUT_DIR" --fail-on-unused-args 2>&1 | tee "$OUT_DIR/gn-gen.log"
+          gn args "$OUT_DIR" --list --short | tee "$OUT_DIR/effective_gn_args.txt"
+
+          grep -F 'target_os = "android"' "$OUT_DIR/effective_gn_args.txt"
+          grep -F 'target_cpu = "arm64"' "$OUT_DIR/effective_gn_args.txt"
+          grep -F 'v8_target_cpu = "arm64"' "$OUT_DIR/effective_gn_args.txt"
+          grep -F 'is_asan = true' "$OUT_DIR/effective_gn_args.txt"
+          grep -F 'is_lsan = false' "$OUT_DIR/effective_gn_args.txt"
+          grep -F 'is_debug = false' "$OUT_DIR/effective_gn_args.txt"
+          grep -F 'dcheck_always_on = false' "$OUT_DIR/effective_gn_args.txt"
+          grep -F 'v8_enable_sandbox = true' "$OUT_DIR/effective_gn_args.txt"
+          grep -F 'v8_enable_memory_corruption_api = true' "$OUT_DIR/effective_gn_args.txt"
+
+      - name: Build ASan d8
+        shell: bash
+        run: |
+          set -euxo pipefail
+          export PATH="$DEPOT_TOOLS:$PATH"
+          cd "$V8_DIR"
+          autoninja -C "$OUT_DIR" -j "$BUILD_JOBS" d8
+          df -h
+
+      - name: Verify ASan instrumentation and build configuration
+        shell: bash
+        run: |
+          set -euxo pipefail
+          export PATH="$DEPOT_TOOLS:$PATH"
+          cd "$V8_DIR"
+
+          test -x "$OUT_DIR/d8"
+          test -f "$OUT_DIR/v8_build_config.json"
+
+          file "$OUT_DIR/d8" | tee "$OUT_DIR/FILE.txt"
+          readelf -h "$OUT_DIR/d8" | tee "$OUT_DIR/ELF_HEADER.txt"
+          readelf -l "$OUT_DIR/d8" | tee "$OUT_DIR/PROGRAM_HEADERS.txt"
+          readelf -d "$OUT_DIR/d8" | tee "$OUT_DIR/DYNAMIC_SECTION.txt"
+          readelf -Ws "$OUT_DIR/d8" > "$OUT_DIR/DYNAMIC_SYMBOLS.txt"
+
+          grep -q 'AArch64' "$OUT_DIR/ELF_HEADER.txt"
+          grep -Eq '__asan_(init|version_mismatch_check)' \
+            "$OUT_DIR/DYNAMIC_SYMBOLS.txt"
+
+          python3 - "$OUT_DIR/v8_build_config.json" <<'PY'
+          import json
+          import sys
+
+          path = sys.argv[1]
+          with open(path, "r", encoding="utf-8") as f:
+              cfg = json.load(f)
+
+          def get(*keys):
+              for key in keys:
+                  if key in cfg:
+                      return cfg[key]
+              return None
+
+          def enabled(*keys):
+              value = get(*keys)
+              return value is True or str(value).lower() == "true"
+
+          required_true = [
+              ("is_android",),
+              ("asan", "is_asan"),
+              ("sandbox", "v8_enable_sandbox"),
+              ("memory_corruption_api", "v8_enable_memory_corruption_api"),
+              ("pointer_compression", "v8_enable_pointer_compression"),
+              (
+                  "pointer_compression_shared_cage",
+                  "v8_enable_pointer_compression_shared_cage",
+              ),
+          ]
+          for keys in required_true:
+              if not enabled(*keys):
+                  raise SystemExit(
+                      f"Expected one of {keys}=true; values: "
+                      + ", ".join(f"{k}={cfg.get(k)!r}" for k in keys)
+                  )
+
+          arch = get("arch", "v8_target_cpu", "target_cpu")
+          if arch not in ("arm64", "aarch64"):
+              raise SystemExit(f"Expected ARM64 target, got {arch!r}")
+
+          if enabled("simulator_run"):
+              raise SystemExit("This is unexpectedly a simulator build")
+          if enabled("dcheck_always_on"):
+              raise SystemExit("ASan build unexpectedly has DCHECKs always on")
+
+          print(json.dumps(cfg, indent=2, sort_keys=True))
+          PY
+
+      - name: Locate Android ASan runtime and host symbolizer
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          ASAN_RUNTIME="$(find \
+            "$V8_DIR/third_party/llvm-build/Release+Asserts/lib/clang" \
+            -type f -name 'libclang_rt.asan-aarch64-android.so' \
+            -print -quit)"
+          LLVM_SYMBOLIZER="$V8_DIR/third_party/llvm-build/Release+Asserts/bin/llvm-symbolizer"
+
+          if [[ -z "$ASAN_RUNTIME" || ! -f "$ASAN_RUNTIME" ]]; then
+            echo "Android AArch64 ASan runtime was not found" >&2
+            exit 1
+          fi
+          if [[ ! -x "$LLVM_SYMBOLIZER" ]]; then
+            echo "Host llvm-symbolizer was not found" >&2
+            exit 1
+          fi
+
+          echo "ASAN_RUNTIME=$ASAN_RUNTIME" >> "$GITHUB_ENV"
+          echo "LLVM_SYMBOLIZER=$LLVM_SYMBOLIZER" >> "$GITHUB_ENV"
+          file "$ASAN_RUNTIME"
+          file "$LLVM_SYMBOLIZER"
+
+      - name: Package runtime and symbols
+        shell: bash
+        run: |
+          set -euxo pipefail
+          export PATH="$DEPOT_TOOLS:$PATH"
+          cd "$V8_DIR"
+
+          RUNTIME_DIR="$PACKAGE_ROOT/v8-android-arm64-sandbox-asan"
+          SYMBOLS_DIR="$PACKAGE_ROOT/v8-android-arm64-sandbox-asan-symbols"
+          mkdir -p "$RUNTIME_DIR/lib" "$SYMBOLS_DIR/out/exe.unstripped" \
+            "$SYMBOLS_DIR/tools"
+
+          install -m 0755 "$OUT_DIR/d8" "$RUNTIME_DIR/d8"
+          install -m 0644 "$ASAN_RUNTIME" \
+            "$RUNTIME_DIR/lib/$(basename "$ASAN_RUNTIME")"
+
+          for name in icudtl.dat snapshot_blob.bin v8_build_config.json \
+                      v8_features.json effective_gn_args.txt gn-gen.log \
+                      FILE.txt ELF_HEADER.txt PROGRAM_HEADERS.txt \
+                      DYNAMIC_SECTION.txt; do
+            if [[ -f "$OUT_DIR/$name" ]]; then
+              install -m 0644 "$OUT_DIR/$name" "$RUNTIME_DIR/$name"
+            fi
+          done
+          install -m 0644 "$OUT_DIR/args.gn" "$RUNTIME_DIR/args.gn"
+
+          if [[ -f "$OUT_DIR/exe.unstripped/d8" ]]; then
+            install -m 0755 "$OUT_DIR/exe.unstripped/d8" \
+              "$SYMBOLS_DIR/out/exe.unstripped/d8"
+          else
+            install -m 0755 "$OUT_DIR/d8" "$SYMBOLS_DIR/out/d8"
+            echo "No separate exe.unstripped/d8 was produced." \
+              > "$SYMBOLS_DIR/NOTICE.txt"
+          fi
+
+          install -m 0755 "$LLVM_SYMBOLIZER" \
+            "$SYMBOLS_DIR/tools/llvm-symbolizer"
+          if [[ -f "$V8_DIR/build/android/asan_symbolize.py" ]]; then
+            install -m 0755 "$V8_DIR/build/android/asan_symbolize.py" \
+              "$SYMBOLS_DIR/tools/asan_symbolize.py"
+          fi
+
+          git rev-parse HEAD > "$RUNTIME_DIR/V8_COMMIT.txt"
+          git show -s --format=fuller HEAD > "$RUNTIME_DIR/V8_COMMIT_DETAILS.txt"
+          cp "$RUNTIME_DIR/V8_COMMIT.txt" "$SYMBOLS_DIR/V8_COMMIT.txt"
+          cp "$OUT_DIR/args.gn" "$SYMBOLS_DIR/args.gn"
+          cp "$OUT_DIR/v8_build_config.json" "$SYMBOLS_DIR/v8_build_config.json"
+
+          gn desc "$OUT_DIR" //:d8 runtime_deps --all \
+            > "$RUNTIME_DIR/runtime_deps_from_gn.txt" || true
+
+          cat > "$RUNTIME_DIR/verify-sandbox.js" <<'EOF'
+          'use strict';
+
+          print('Sandbox API type: ' + typeof Sandbox);
+          if (typeof Sandbox !== 'object') {
+            throw new Error('Sandbox testing API is unavailable');
+          }
+
+          print('Sandbox base: 0x' + Sandbox.base.toString(16));
+          const view = new Sandbox.MemoryView(0, 0x1000);
+          print('Sandbox.MemoryView length: 0x' + view.byteLength.toString(16));
+          print('Android ARM64 ASan sandbox-testing build is ready.');
+          EOF
+
+          cat > "$RUNTIME_DIR/run-asan-poc.sh" <<'EOF'
+          #!/system/bin/sh
+          set -eu
+
+          HERE="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+          cd "$HERE"
+
+          ASAN_RT="$HERE/lib/libclang_rt.asan-aarch64-android.so"
+          export LD_LIBRARY_PATH="$HERE/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          if [ -f "$ASAN_RT" ]; then
+            export LD_PRELOAD="$ASAN_RT${LD_PRELOAD:+:$LD_PRELOAD}"
+          fi
+
+          # LeakSanitizer is intentionally disabled: the V8 memory-corruption
+          # API is incompatible with LSan, and Android classic ASan is legacy.
+          export ASAN_OPTIONS="${ASAN_OPTIONS:-detect_leaks=0:halt_on_error=1:abort_on_error=1:disable_coredump=0:print_summary=1:symbolize=0}"
+
+          exec "$HERE/d8" \
+            --run-as-sandbox-security-poc \
+            --sandbox-prohibit-insecure-mode \
+            "$@"
+          EOF
+          chmod 0755 "$RUNTIME_DIR/run-asan-poc.sh"
+
+          cat > "$RUNTIME_DIR/run-asan-d8.sh" <<'EOF'
+          #!/system/bin/sh
+          set -eu
+
+          HERE="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+          cd "$HERE"
+
+          ASAN_RT="$HERE/lib/libclang_rt.asan-aarch64-android.so"
+          export LD_LIBRARY_PATH="$HERE/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          if [ -f "$ASAN_RT" ]; then
+            export LD_PRELOAD="$ASAN_RT${LD_PRELOAD:+:$LD_PRELOAD}"
+          fi
+          export ASAN_OPTIONS="${ASAN_OPTIONS:-detect_leaks=0:halt_on_error=1:abort_on_error=1:disable_coredump=0:print_summary=1:symbolize=0}"
+
+          exec "$HERE/d8" "$@"
+          EOF
+          chmod 0755 "$RUNTIME_DIR/run-asan-d8.sh"
+
+          cat > "$SYMBOLS_DIR/symbolize-log.sh" <<'EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          HERE="$(cd -- "$(dirname -- "$0")" && pwd)"
+          if [[ $# -ne 1 ]]; then
+            echo "Usage: $0 <android-asan-log.txt>" >&2
+            exit 2
+          fi
+
+          export ASAN_SYMBOLIZER_PATH="$HERE/tools/llvm-symbolizer"
+          if [[ -x "$HERE/tools/asan_symbolize.py" ]]; then
+            python3 "$HERE/tools/asan_symbolize.py" \
+              --output-directory "$HERE/out" < "$1"
+          else
+            echo "asan_symbolize.py was not packaged; use llvm-symbolizer manually." >&2
+            exit 1
+          fi
+          EOF
+          chmod 0755 "$SYMBOLS_DIR/symbolize-log.sh"
+
+          {
+            echo "V8 Android ARM64 classic ASan Sandbox PoC build"
+            echo "V8 commit: $V8_COMMIT"
+            echo "V8 ref requested: $V8_REF"
+            echo "GitHub run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            echo "Runner: $RUNNER_NAME"
+            echo "Runner OS: $RUNNER_OS $RUNNER_ARCH"
+            echo "Build jobs: $BUILD_JOBS"
+            echo "Sanitizer: classic AddressSanitizer (is_asan=true)"
+            echo "Important: Chromium currently marks classic Android ASan unsupported and recommends HWASan."
+            echo
+            file "$OUT_DIR/d8"
+            readelf -l "$OUT_DIR/d8" | grep -F 'Requesting program interpreter' || true
+            readelf -d "$OUT_DIR/d8" | grep -F '(NEEDED)' || true
+          } > "$RUNTIME_DIR/BUILD_INFO.txt"
+
+          cat > "$RUNTIME_DIR/README-RUN.txt" <<'EOF'
+          This is an Android/Bionic ARM64 classic-ASan d8 build.
+
+          Basic check:
+            chmod +x d8 run-asan-d8.sh run-asan-poc.sh
+            ./run-asan-d8.sh --version
+            ./run-asan-poc.sh verify-sandbox.js
+
+          PoC run:
+            ./run-asan-poc.sh poc.js >poc.stdout.txt 2>poc.stderr.txt
+
+          Keep --sandbox-prohibit-insecure-mode enabled for a security claim.
+          Do not treat a result requiring --no-sandbox-prohibit-insecure-mode as
+          evidence of a production Android V8 sandbox escape.
+
+          Classic Android ASan is currently unsupported upstream. If the runtime
+          fails before V8 starts, use an older matching V8 revision or build an
+          Android ARM64 HWASan variant on a compatible Android environment.
+          EOF
+
+          (
+            cd "$RUNTIME_DIR"
+            find . -type f -print0 | sort -z | xargs -0 sha256sum \
+              > SHA256SUMS.txt
+          )
+          (
+            cd "$SYMBOLS_DIR"
+            find . -type f -print0 | sort -z | xargs -0 sha256sum \
+              > SHA256SUMS.txt
           )
 
-          case "$config" in
-            debug)
-              gn_args=$(cat <<EOF
-          ${common_args}
-          is_debug = true
-          angle_assert_always_on = true
-          dcheck_always_on = true
-          EOF
-              )
-              ;;
-            asan)
-              gn_args=$(cat <<EOF
-          ${common_args}
-          is_debug = false
-          is_asan = true
-          angle_assert_always_on = true
-          dcheck_always_on = true
-          EOF
-              )
-              ;;
-            ubsan)
-              gn_args=$(cat <<EOF
-          ${common_args}
-          is_debug = false
-          is_ubsan = true
-          is_ubsan_no_recover = true
-          angle_assert_always_on = true
-          dcheck_always_on = true
-          EOF
-              )
-              ;;
-            *)
-              echo "Unknown configuration: $config" >&2
-              exit 2
-              ;;
-          esac
+          cd "$PACKAGE_ROOT"
+          tar --zstd -cf \
+            "$GITHUB_WORKSPACE/v8-android-arm64-sandbox-asan-${V8_SHORT_SHA}.tar.zst" \
+            "$(basename "$RUNTIME_DIR")"
+          tar --zstd -cf \
+            "$GITHUB_WORKSPACE/v8-android-arm64-sandbox-asan-symbols-${V8_SHORT_SHA}.tar.zst" \
+            "$(basename "$SYMBOLS_DIR")"
 
-          mkdir -p "$out_dir" "$ARCHIVE_DIR" "$LOG_DIR"
-          printf '%s\n' "$gn_args" > "$args_file"
+          cd "$GITHUB_WORKSPACE"
+          sha256sum \
+            "v8-android-arm64-sandbox-asan-${V8_SHORT_SHA}.tar.zst" \
+            "v8-android-arm64-sandbox-asan-symbols-${V8_SHORT_SHA}.tar.zst" \
+            > ARTIFACT_SHA256SUMS.txt
 
+          ls -lh *.tar.zst ARTIFACT_SHA256SUMS.txt
+
+      - name: Upload ASan d8 artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: v8-android-arm64-sandbox-asan-${{ env.V8_SHORT_SHA }}
+          path: |
+            v8-android-arm64-sandbox-asan-${{ env.V8_SHORT_SHA }}.tar.zst
+            v8-android-arm64-sandbox-asan-symbols-${{ env.V8_SHORT_SHA }}.tar.zst
+            ARTIFACT_SHA256SUMS.txt
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+      - name: Write job summary
+        shell: bash
+        run: |
           {
-            echo "===== ANGLE $config configuration ====="
-            echo "Commit: $ANGLE_COMMIT"
-            echo "Jobs: $jobs"
-            echo "Output: $out_dir"
+            echo "## V8 Android ARM64 classic ASan sandbox PoC build"
             echo
-            echo "$gn_args"
-          } | tee "$log_file"
-
-          cd "$ANGLE_SRC"
-
-          "$gn_bin" gen "$out_rel" --args="$gn_args" 2>&1 | tee -a "$log_file"
-          "$gn_bin" args "$out_rel" --list > "$out_dir/GN_ARGS_EXPANDED.txt"
-
-          autoninja -C "$out_rel" -j "$jobs" 2>&1 | tee -a "$log_file"
-
-          test -s "$out_dir/libEGL.so"
-          test -s "$out_dir/libGLESv2.so"
-
-          cat > "$out_dir/BUILD_INFO.txt" <<EOF
-          ANGLE commit: $ANGLE_COMMIT
-          ANGLE commit time: $ANGLE_COMMIT_TIME
-          GN binary: $gn_bin
-          GN version: $($gn_bin --version)
-          Configuration: $config
-          Target OS: linux
-          Target CPU: x64
-          Parallel jobs: $jobs
-          Runner: ${RUNNER_NAME:-unknown}
-          Runner OS: ${RUNNER_OS:-unknown}
-          Runner architecture: ${RUNNER_ARCH:-unknown}
-          Built UTC: $(date -u +%Y-%m-%dT%H:%M:%SZ)
-          EOF
-
-          find "$out_dir" -maxdepth 1 -type f -printf '%f\t%s bytes\n' \
-            | sort > "$out_dir/TOP_LEVEL_FILES.txt"
-
-          rm -f "$archive" "$archive.sha256"
-          7z a -tzip -mx=1 -mmt=on "$archive" "$out_rel"
-          sha256sum "$archive" | tee "$archive.sha256"
-
-          archive_size="$(du -h "$archive" | cut -f1)"
-          {
+            echo "- Commit: \`$V8_COMMIT\`"
+            echo "- Requested ref: \`$V8_REF\`"
+            echo "- Target: \`android/arm64\`"
+            echo "- Sanitizer: \`is_asan=true\`"
+            echo "- Sandbox: enabled"
+            echo "- Memory corruption API: enabled"
+            echo "- DCHECK always on: disabled"
+            echo "- Build jobs: \`$BUILD_JOBS\`"
+            echo "- Artifact: \`v8-android-arm64-sandbox-asan-$V8_SHORT_SHA\`"
             echo
-            echo "### ${config^^}"
+            echo "> Chromium currently warns that classic Android ASan is unsupported and recommends HWASan on ARM64."
             echo
-            echo "- Archive: \`$(basename "$archive")\`"
-            echo "- Size: \`$archive_size\`"
-            echo "- SHA-256: \`$(cut -d' ' -f1 "$archive.sha256")\`"
+            echo "The binary targets Android/Bionic and cannot execute directly on the x64 GitHub runner."
           } >> "$GITHUB_STEP_SUMMARY"
-
-          rm -rf "$out_dir"
-          df -h
-          SCRIPT
-
-          chmod +x "$RUNNER_TEMP/build-angle-config.sh"
-
-      - name: Build and package Debug
-        shell: bash
-        run: "$RUNNER_TEMP/build-angle-config.sh debug"
-
-      - name: Upload Debug build
-        uses: actions/upload-artifact@v7
-        with:
-          name: angle-debug-linux-x64-${{ steps.source.outputs.short_commit }}
-          path: |
-            ${{ env.ARCHIVE_DIR }}/angle-debug-linux-x64-${{ steps.source.outputs.short_commit }}.zip
-            ${{ env.ARCHIVE_DIR }}/angle-debug-linux-x64-${{ steps.source.outputs.short_commit }}.zip.sha256
-          if-no-files-found: error
-          compression-level: 0
-          retention-days: ${{ inputs.retention_days }}
-
-      - name: Remove uploaded Debug package
-        if: always()
-        shell: bash
-        run: rm -f "$ARCHIVE_DIR"/angle-debug-linux-x64-*.zip*
-
-      - name: Build and package ASan
-        shell: bash
-        run: "$RUNNER_TEMP/build-angle-config.sh asan"
-
-      - name: Upload ASan build
-        uses: actions/upload-artifact@v7
-        with:
-          name: angle-asan-linux-x64-${{ steps.source.outputs.short_commit }}
-          path: |
-            ${{ env.ARCHIVE_DIR }}/angle-asan-linux-x64-${{ steps.source.outputs.short_commit }}.zip
-            ${{ env.ARCHIVE_DIR }}/angle-asan-linux-x64-${{ steps.source.outputs.short_commit }}.zip.sha256
-          if-no-files-found: error
-          compression-level: 0
-          retention-days: ${{ inputs.retention_days }}
-
-      - name: Remove uploaded ASan package
-        if: always()
-        shell: bash
-        run: rm -f "$ARCHIVE_DIR"/angle-asan-linux-x64-*.zip*
-
-      - name: Build and package UBSan
-        shell: bash
-        run: "$RUNNER_TEMP/build-angle-config.sh ubsan"
-
-      - name: Upload UBSan build
-        uses: actions/upload-artifact@v7
-        with:
-          name: angle-ubsan-linux-x64-${{ steps.source.outputs.short_commit }}
-          path: |
-            ${{ env.ARCHIVE_DIR }}/angle-ubsan-linux-x64-${{ steps.source.outputs.short_commit }}.zip
-            ${{ env.ARCHIVE_DIR }}/angle-ubsan-linux-x64-${{ steps.source.outputs.short_commit }}.zip.sha256
-          if-no-files-found: error
-          compression-level: 0
-          retention-days: ${{ inputs.retention_days }}
-
-      - name: Remove uploaded UBSan package
-        if: always()
-        shell: bash
-        run: rm -f "$ARCHIVE_DIR"/angle-ubsan-linux-x64-*.zip*
-
-      - name: Upload build logs and resolved GN arguments
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: angle-build-logs-${{ steps.source.outputs.short_commit || github.run_id }}
-          path: |
-            ${{ env.LOG_DIR }}
-            ${{ runner.temp }}/depot-tools-bootstrap.txt
-          if-no-files-found: warn
-          compression-level: 6
-          retention-days: ${{ inputs.retention_days }}
           
