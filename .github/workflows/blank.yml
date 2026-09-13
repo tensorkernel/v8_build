@@ -1,544 +1,373 @@
-name: Build V8 Android ARM64 ASan Sandbox PoC
+name: Build FFmpeg Security Runtimes
 
 on:
   workflow_dispatch:
     inputs:
-      v8_ref:
-        description: "V8 branch, tag, or full commit SHA"
-        required: true
-        default: "main"
-        type: string
-  push:
-    paths:
-      - ".github/workflows/build-v8-android-arm64-asan.yml"
-
-permissions:
-  contents: read
-
-concurrency:
-  group: v8-android-arm64-asan-${{ github.ref }}
-  cancel-in-progress: false
-
-env:
-  DEPOT_TOOLS: ${{ github.workspace }}/depot_tools
-  SRC_ROOT: ${{ github.workspace }}/v8-work
-  V8_DIR: ${{ github.workspace }}/v8-work/v8
-  OUT_DIR: ${{ github.workspace }}/v8-work/v8/out.gn/android-arm64-sandbox-asan
-  PACKAGE_ROOT: ${{ github.workspace }}/packages
-  V8_REF: ${{ inputs.v8_ref || 'main' }}
+      ffmpeg_ref:
+        description: "FFmpeg git ref, branch, tag, or commit"
+        required: false
+        default: "master"
 
 jobs:
   build:
-    name: Android ARM64 ASan d8
-    runs-on: ubuntu-24.04
-    timeout-minutes: 420
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    strategy:
+      max-parallel: 1
+      fail-fast: false
+      matrix:
+        include:
+          - name: release
+            cc: gcc
+            cxx: g++
+            configure_extra: "--disable-stripping --enable-debug=2"
+            cflags: "-O2 -g -fno-omit-frame-pointer"
+            ldflags: ""
+            essential_targets: "ffmpeg ffprobe"
+            optional_targets: ""
+
+          - name: debug
+            cc: gcc
+            cxx: g++
+            configure_extra: "--disable-stripping --enable-debug=3 --disable-optimizations"
+            cflags: "-O0 -g3 -fno-omit-frame-pointer"
+            ldflags: ""
+            essential_targets: "ffmpeg ffprobe"
+            optional_targets: ""
+
+          - name: asan-ubsan
+            cc: clang
+            cxx: clang++
+            configure_extra: "--disable-stripping --enable-debug=3 --disable-optimizations --toolchain=clang-asan"
+            cflags: "-O1 -g3 -fno-omit-frame-pointer -fsanitize=address,undefined,signed-integer-overflow,float-cast-overflow"
+            ldflags: "-fsanitize=address,undefined,signed-integer-overflow,float-cast-overflow"
+            essential_targets: "ffmpeg ffprobe"
+            optional_targets: "tests/videogen tools/target_dem_fuzzer"
+
+          - name: ubsan-strict
+            cc: clang
+            cxx: clang++
+            configure_extra: "--disable-stripping --enable-debug=3 --disable-optimizations --cc=clang --cxx=clang++"
+            cflags: "-O1 -g3 -fno-omit-frame-pointer -fsanitize=undefined,signed-integer-overflow,float-cast-overflow -fno-sanitize-recover=all"
+            ldflags: "-fsanitize=undefined,signed-integer-overflow,float-cast-overflow"
+            essential_targets: "ffmpeg ffprobe"
+            optional_targets: "tests/videogen"
+
+          - name: shared-dev
+            cc: gcc
+            cxx: g++
+            configure_extra: "--disable-stripping --enable-shared --disable-static --enable-debug=2"
+            cflags: "-O1 -g3 -fno-omit-frame-pointer"
+            ldflags: ""
+            essential_targets: "ffmpeg ffprobe"
+            optional_targets: ""
+
+          - name: fate-tools-asan
+            cc: clang
+            cxx: clang++
+            configure_extra: "--disable-stripping --enable-debug=3 --disable-optimizations --toolchain=clang-asan"
+            cflags: "-O0 -g3 -fno-omit-frame-pointer -fsanitize=address,undefined,signed-integer-overflow,float-cast-overflow"
+            ldflags: "-fsanitize=address,undefined,signed-integer-overflow,float-cast-overflow"
+            essential_targets: "ffmpeg ffprobe"
+            optional_targets: "tests/videogen tools/target_dem_fuzzer"
 
     steps:
-      - name: Show runner resources
+      - name: Install dependencies
         shell: bash
         run: |
           set -euxo pipefail
-          uname -a
-          nproc
-          free -h
-          df -h
 
-      - name: Reclaim runner disk space
-        shell: bash
-        run: |
-          set -euxo pipefail
-          sudo rm -rf \
-            /usr/local/lib/android \
-            /usr/share/dotnet \
-            /opt/ghc \
-            /usr/local/.ghcup \
-            /usr/local/share/boost \
-            /usr/share/swift \
-            /opt/hostedtoolcache/CodeQL || true
-          docker system prune --all --force --volumes || true
-          sudo apt-get clean
-          df -h
-
-      - name: Install bootstrap packages
-        shell: bash
-        run: |
-          set -euxo pipefail
           sudo apt-get update
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            binutils \
-            ca-certificates \
-            curl \
-            file \
-            git \
-            jq \
-            lsb-release \
-            ninja-build \
-            pkg-config \
-            python3 \
-            python3-setuptools \
-            unzip \
-            xz-utils \
-            zip \
-            zstd
+          sudo apt-get install -y \
+            git build-essential clang lld pkg-config yasm nasm \
+            zlib1g-dev libssl-dev libxml2-dev zip curl python3 ca-certificates \
+            file xz-utils
 
-      - name: Install depot_tools
-        shell: bash
-        run: |
-          set -euxo pipefail
-          git clone --depth=1 \
-            https://chromium.googlesource.com/chromium/tools/depot_tools.git \
-            "$DEPOT_TOOLS"
-          echo "$DEPOT_TOOLS" >> "$GITHUB_PATH"
-          export PATH="$DEPOT_TOOLS:$PATH"
-          gclient --version
-
-      - name: Check out V8 and Android dependencies
-        shell: bash
-        run: |
-          set -euxo pipefail
-          export PATH="$DEPOT_TOOLS:$PATH"
-
-          mkdir -p "$SRC_ROOT"
-          git init "$V8_DIR"
-          git -C "$V8_DIR" remote add origin \
-            https://chromium.googlesource.com/v8/v8.git
-          git -C "$V8_DIR" fetch --depth=1 origin "$V8_REF"
-          git -C "$V8_DIR" checkout --detach FETCH_HEAD
-
-          cat > "$SRC_ROOT/.gclient" <<'EOF'
-          solutions = [
-            {
-              "name": "v8",
-              "url": "https://chromium.googlesource.com/v8/v8.git",
-              "deps_file": "DEPS",
-              "managed": False,
-              "custom_deps": {},
-              "custom_vars": {},
-            },
-          ]
-          target_os = ["android", "unix"]
-          EOF
-
-          cd "$SRC_ROOT"
-          gclient sync --nohooks --no-history --shallow -D
-
-          V8_COMMIT="$(git -C "$V8_DIR" rev-parse HEAD)"
-          V8_SHORT_SHA="$(git -C "$V8_DIR" rev-parse --short=12 HEAD)"
-          echo "V8_COMMIT=$V8_COMMIT" >> "$GITHUB_ENV"
-          echo "V8_SHORT_SHA=$V8_SHORT_SHA" >> "$GITHUB_ENV"
-          git -C "$V8_DIR" show -s --format=fuller HEAD
-          df -h
-
-      - name: Install V8 Linux and Android build dependencies
-        shell: bash
-        run: |
-          set -euxo pipefail
-          export PATH="$DEPOT_TOOLS:$PATH"
-          cd "$V8_DIR"
-          env DEBIAN_FRONTEND=noninteractive \
-            ./build/install-build-deps.sh --no-prompt
-          gclient runhooks
-          df -h
-
-      - name: Select safe parallelism
-        shell: bash
-        run: |
-          set -euxo pipefail
-          CPUS="$(nproc)"
-          MEM_GIB="$(awk '/MemTotal/ {print int($2 / 1024 / 1024)}' /proc/meminfo)"
-          JOBS_BY_MEM=$(( MEM_GIB / 3 ))
-          if (( JOBS_BY_MEM < 2 )); then JOBS_BY_MEM=2; fi
-          if (( CPUS < JOBS_BY_MEM )); then
-            BUILD_JOBS="$CPUS"
-          else
-            BUILD_JOBS="$JOBS_BY_MEM"
-          fi
-          echo "BUILD_JOBS=$BUILD_JOBS" >> "$GITHUB_ENV"
-          echo "Using $BUILD_JOBS build jobs ($CPUS CPUs, ${MEM_GIB} GiB RAM)"
-
-      - name: Generate Android ARM64 ASan sandbox build
-        shell: bash
-        run: |
-          set -euxo pipefail
-          export PATH="$DEPOT_TOOLS:$PATH"
-          cd "$V8_DIR"
-          mkdir -p "$OUT_DIR"
-
-          cat > "$OUT_DIR/args.gn" <<'EOF'
-          # Real Android ARM64 target, not the ARM64 simulator.
-          target_os = "android"
-          target_cpu = "arm64"
-          v8_target_cpu = "arm64"
-
-          # Release-mode standalone d8 with detailed native symbols.
-          is_component_build = false
-          is_debug = false
-          is_official_build = false
-          dcheck_always_on = false
-          symbol_level = 2
-
-          # Classic AddressSanitizer. Chromium currently warns that classic
-          # Android ASan is unsupported and recommends is_hwasan=true instead.
-          is_asan = true
-          is_lsan = false
-
-          # Android's supported production sandbox geometry plus the official
-          # memory-corruption API used by V8 sandbox security PoCs.
-          v8_enable_pointer_compression = true
-          v8_enable_pointer_compression_shared_cage = true
-          v8_enable_external_code_space = true
-          v8_enable_sandbox = true
-          v8_enable_memory_corruption_api = true
-
-          # Keep the main build release-like rather than DCHECK/debug based.
-          v8_enable_slow_dchecks = false
-          v8_enable_verify_heap = false
-
-          # Route d8 output to stdout under Android/ADB.
-          v8_android_log_stdout = true
-
-          # Do not fail research builds solely because a new warning landed.
-          treat_warnings_as_errors = false
-          EOF
-
-          # GN currently emits an expected warning that is_asan on Android is
-          # unsupported. It does not reject the build.
-          gn gen "$OUT_DIR" --fail-on-unused-args 2>&1 | tee "$OUT_DIR/gn-gen.log"
-          gn args "$OUT_DIR" --list --short | tee "$OUT_DIR/effective_gn_args.txt"
-
-          grep -F 'target_os = "android"' "$OUT_DIR/effective_gn_args.txt"
-          grep -F 'target_cpu = "arm64"' "$OUT_DIR/effective_gn_args.txt"
-          grep -F 'v8_target_cpu = "arm64"' "$OUT_DIR/effective_gn_args.txt"
-          grep -F 'is_asan = true' "$OUT_DIR/effective_gn_args.txt"
-          grep -F 'is_lsan = false' "$OUT_DIR/effective_gn_args.txt"
-          grep -F 'is_debug = false' "$OUT_DIR/effective_gn_args.txt"
-          grep -F 'dcheck_always_on = false' "$OUT_DIR/effective_gn_args.txt"
-          grep -F 'v8_enable_sandbox = true' "$OUT_DIR/effective_gn_args.txt"
-          grep -F 'v8_enable_memory_corruption_api = true' "$OUT_DIR/effective_gn_args.txt"
-
-      - name: Build ASan d8
-        shell: bash
-        run: |
-          set -euxo pipefail
-          export PATH="$DEPOT_TOOLS:$PATH"
-          cd "$V8_DIR"
-          autoninja -C "$OUT_DIR" -j "$BUILD_JOBS" d8
-          df -h
-
-      - name: Verify ASan instrumentation and build configuration
-        shell: bash
-        run: |
-          set -euxo pipefail
-          export PATH="$DEPOT_TOOLS:$PATH"
-          cd "$V8_DIR"
-
-          test -x "$OUT_DIR/d8"
-          test -f "$OUT_DIR/v8_build_config.json"
-
-          file "$OUT_DIR/d8" | tee "$OUT_DIR/FILE.txt"
-          readelf -h "$OUT_DIR/d8" | tee "$OUT_DIR/ELF_HEADER.txt"
-          readelf -l "$OUT_DIR/d8" | tee "$OUT_DIR/PROGRAM_HEADERS.txt"
-          readelf -d "$OUT_DIR/d8" | tee "$OUT_DIR/DYNAMIC_SECTION.txt"
-          readelf -Ws "$OUT_DIR/d8" > "$OUT_DIR/DYNAMIC_SYMBOLS.txt"
-
-          grep -q 'AArch64' "$OUT_DIR/ELF_HEADER.txt"
-          grep -Eq '__asan_(init|version_mismatch_check)' \
-            "$OUT_DIR/DYNAMIC_SYMBOLS.txt"
-
-          python3 - "$OUT_DIR/v8_build_config.json" <<'PY'
-          import json
-          import sys
-
-          path = sys.argv[1]
-          with open(path, "r", encoding="utf-8") as f:
-              cfg = json.load(f)
-
-          def get(*keys):
-              for key in keys:
-                  if key in cfg:
-                      return cfg[key]
-              return None
-
-          def enabled(*keys):
-              value = get(*keys)
-              return value is True or str(value).lower() == "true"
-
-          required_true = [
-              ("is_android",),
-              ("asan", "is_asan"),
-              ("sandbox", "v8_enable_sandbox"),
-              ("memory_corruption_api", "v8_enable_memory_corruption_api"),
-              ("pointer_compression", "v8_enable_pointer_compression"),
-              (
-                  "pointer_compression_shared_cage",
-                  "v8_enable_pointer_compression_shared_cage",
-              ),
-          ]
-          for keys in required_true:
-              if not enabled(*keys):
-                  raise SystemExit(
-                      f"Expected one of {keys}=true; values: "
-                      + ", ".join(f"{k}={cfg.get(k)!r}" for k in keys)
-                  )
-
-          arch = get("arch", "v8_target_cpu", "target_cpu")
-          if arch not in ("arm64", "aarch64"):
-              raise SystemExit(f"Expected ARM64 target, got {arch!r}")
-
-          if enabled("simulator_run"):
-              raise SystemExit("This is unexpectedly a simulator build")
-          if enabled("dcheck_always_on"):
-              raise SystemExit("ASan build unexpectedly has DCHECKs always on")
-
-          print(json.dumps(cfg, indent=2, sort_keys=True))
-          PY
-
-      - name: Locate Android ASan runtime and host symbolizer
+      - name: Clone FFmpeg
         shell: bash
         run: |
           set -euxo pipefail
 
-          ASAN_RUNTIME="$(find \
-            "$V8_DIR/third_party/llvm-build/Release+Asserts/lib/clang" \
-            -type f -name 'libclang_rt.asan-aarch64-android.so' \
-            -print -quit)"
-          LLVM_SYMBOLIZER="$V8_DIR/third_party/llvm-build/Release+Asserts/bin/llvm-symbolizer"
+          git clone https://github.com/FFmpeg/FFmpeg.git ffmpeg
+          cd ffmpeg
+          git checkout "${{ github.event.inputs.ffmpeg_ref }}"
+          git rev-parse HEAD | tee ../FFMPEG_COMMIT.txt
+          git status --short
 
-          if [[ -z "$ASAN_RUNTIME" || ! -f "$ASAN_RUNTIME" ]]; then
-            echo "Android AArch64 ASan runtime was not found" >&2
-            exit 1
-          fi
-          if [[ ! -x "$LLVM_SYMBOLIZER" ]]; then
-            echo "Host llvm-symbolizer was not found" >&2
-            exit 1
+      - name: Configure FFmpeg
+        shell: bash
+        working-directory: ffmpeg
+        env:
+          CC: ${{ matrix.cc }}
+          CXX: ${{ matrix.cxx }}
+          CONFIGURE_EXTRA: ${{ matrix.configure_extra }}
+          CFLAGS_EXTRA: ${{ matrix.cflags }}
+          LDFLAGS_EXTRA: ${{ matrix.ldflags }}
+        run: |
+          set -euxo pipefail
+
+          mkdir -p "../out/${{ matrix.name }}"
+
+          read -r -a CFG_ARGS <<< "$CONFIGURE_EXTRA"
+
+          CMD=(
+            ./configure
+            --prefix="$PWD/../out/${{ matrix.name }}"
+            "${CFG_ARGS[@]}"
+            --extra-cflags="$CFLAGS_EXTRA"
+          )
+
+          if [ -n "$LDFLAGS_EXTRA" ]; then
+            CMD+=(--extra-ldflags="$LDFLAGS_EXTRA")
           fi
 
-          echo "ASAN_RUNTIME=$ASAN_RUNTIME" >> "$GITHUB_ENV"
-          echo "LLVM_SYMBOLIZER=$LLVM_SYMBOLIZER" >> "$GITHUB_ENV"
-          file "$ASAN_RUNTIME"
-          file "$LLVM_SYMBOLIZER"
+          echo "[+] Configure command:"
+          printf ' %q' "${CMD[@]}"
+          printf '\n'
 
-      - name: Package runtime and symbols
+          "${CMD[@]}"
+
+      - name: Build essential targets
         shell: bash
+        working-directory: ffmpeg
         run: |
           set -euxo pipefail
-          export PATH="$DEPOT_TOOLS:$PATH"
-          cd "$V8_DIR"
 
-          RUNTIME_DIR="$PACKAGE_ROOT/v8-android-arm64-sandbox-asan"
-          SYMBOLS_DIR="$PACKAGE_ROOT/v8-android-arm64-sandbox-asan-symbols"
-          mkdir -p "$RUNTIME_DIR/lib" "$SYMBOLS_DIR/out/exe.unstripped" \
-            "$SYMBOLS_DIR/tools"
+          echo "[+] Building essential targets: ${{ matrix.essential_targets }}"
 
-          install -m 0755 "$OUT_DIR/d8" "$RUNTIME_DIR/d8"
-          install -m 0644 "$ASAN_RUNTIME" \
-            "$RUNTIME_DIR/lib/$(basename "$ASAN_RUNTIME")"
+          for target in ${{ matrix.essential_targets }}; do
+            echo "[+] make $target"
+            make -j"$(nproc)" "$target"
+          done
 
-          for name in icudtl.dat snapshot_blob.bin v8_build_config.json \
-                      v8_features.json effective_gn_args.txt gn-gen.log \
-                      FILE.txt ELF_HEADER.txt PROGRAM_HEADERS.txt \
-                      DYNAMIC_SECTION.txt; do
-            if [[ -f "$OUT_DIR/$name" ]]; then
-              install -m 0644 "$OUT_DIR/$name" "$RUNTIME_DIR/$name"
+      - name: Build optional targets
+        shell: bash
+        working-directory: ffmpeg
+        run: |
+          set -uxo pipefail
+
+          echo "[+] Optional targets: ${{ matrix.optional_targets }}"
+
+          for target in ${{ matrix.optional_targets }}; do
+            echo "[+] Trying optional target: $target"
+            if make -j"$(nproc)" "$target"; then
+              echo "[OK] Built optional target: $target"
+            else
+              echo "[WARN] Optional target failed or does not exist: $target"
             fi
           done
-          install -m 0644 "$OUT_DIR/args.gn" "$RUNTIME_DIR/args.gn"
 
-          if [[ -f "$OUT_DIR/exe.unstripped/d8" ]]; then
-            install -m 0755 "$OUT_DIR/exe.unstripped/d8" \
-              "$SYMBOLS_DIR/out/exe.unstripped/d8"
+          if echo "${{ matrix.optional_targets }}" | grep -q "tests/videogen"; then
+            if [ ! -x tests/videogen ]; then
+              echo "[WARN] tests/videogen missing. Trying manual fallback compile."
+
+              if echo "${{ matrix.name }}" | grep -Eq "asan|ubsan"; then
+                ${{ matrix.cc }} \
+                  -O0 -g3 -fno-omit-frame-pointer \
+                  -fsanitize=address,undefined,signed-integer-overflow,float-cast-overflow \
+                  -I. -I./ \
+                  -o tests/videogen \
+                  tests/videogen.c -lm || echo "[WARN] manual videogen fallback failed"
+              else
+                ${{ matrix.cc }} \
+                  -O0 -g3 -fno-omit-frame-pointer \
+                  -I. -I./ \
+                  -o tests/videogen \
+                  tests/videogen.c -lm || echo "[WARN] manual videogen fallback failed"
+              fi
+            fi
+          fi
+
+      - name: Install FFmpeg
+        shell: bash
+        working-directory: ffmpeg
+        run: |
+          set -uxo pipefail
+
+          echo "[+] Running make install"
+          if make install; then
+            echo "[OK] make install succeeded"
           else
-            install -m 0755 "$OUT_DIR/d8" "$SYMBOLS_DIR/out/d8"
-            echo "No separate exe.unstripped/d8 was produced." \
-              > "$SYMBOLS_DIR/NOTICE.txt"
+            echo "[WARN] make install failed. Packaging will continue from build tree."
           fi
 
-          install -m 0755 "$LLVM_SYMBOLIZER" \
-            "$SYMBOLS_DIR/tools/llvm-symbolizer"
-          if [[ -f "$V8_DIR/build/android/asan_symbolize.py" ]]; then
-            install -m 0755 "$V8_DIR/build/android/asan_symbolize.py" \
-              "$SYMBOLS_DIR/tools/asan_symbolize.py"
-          fi
-
-          git rev-parse HEAD > "$RUNTIME_DIR/V8_COMMIT.txt"
-          git show -s --format=fuller HEAD > "$RUNTIME_DIR/V8_COMMIT_DETAILS.txt"
-          cp "$RUNTIME_DIR/V8_COMMIT.txt" "$SYMBOLS_DIR/V8_COMMIT.txt"
-          cp "$OUT_DIR/args.gn" "$SYMBOLS_DIR/args.gn"
-          cp "$OUT_DIR/v8_build_config.json" "$SYMBOLS_DIR/v8_build_config.json"
-
-          gn desc "$OUT_DIR" //:d8 runtime_deps --all \
-            > "$RUNTIME_DIR/runtime_deps_from_gn.txt" || true
-
-          cat > "$RUNTIME_DIR/verify-sandbox.js" <<'EOF'
-          'use strict';
-
-          print('Sandbox API type: ' + typeof Sandbox);
-          if (typeof Sandbox !== 'object') {
-            throw new Error('Sandbox testing API is unavailable');
-          }
-
-          print('Sandbox base: 0x' + Sandbox.base.toString(16));
-          const view = new Sandbox.MemoryView(0, 0x1000);
-          print('Sandbox.MemoryView length: 0x' + view.byteLength.toString(16));
-          print('Android ARM64 ASan sandbox-testing build is ready.');
-          EOF
-
-          cat > "$RUNTIME_DIR/run-asan-poc.sh" <<'EOF'
-          #!/system/bin/sh
-          set -eu
-
-          HERE="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
-          cd "$HERE"
-
-          ASAN_RT="$HERE/lib/libclang_rt.asan-aarch64-android.so"
-          export LD_LIBRARY_PATH="$HERE/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-          if [ -f "$ASAN_RT" ]; then
-            export LD_PRELOAD="$ASAN_RT${LD_PRELOAD:+:$LD_PRELOAD}"
-          fi
-
-          # LeakSanitizer is intentionally disabled: the V8 memory-corruption
-          # API is incompatible with LSan, and Android classic ASan is legacy.
-          export ASAN_OPTIONS="${ASAN_OPTIONS:-detect_leaks=0:halt_on_error=1:abort_on_error=1:disable_coredump=0:print_summary=1:symbolize=0}"
-
-          exec "$HERE/d8" \
-            --run-as-sandbox-security-poc \
-            --sandbox-prohibit-insecure-mode \
-            "$@"
-          EOF
-          chmod 0755 "$RUNTIME_DIR/run-asan-poc.sh"
-
-          cat > "$RUNTIME_DIR/run-asan-d8.sh" <<'EOF'
-          #!/system/bin/sh
-          set -eu
-
-          HERE="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
-          cd "$HERE"
-
-          ASAN_RT="$HERE/lib/libclang_rt.asan-aarch64-android.so"
-          export LD_LIBRARY_PATH="$HERE/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-          if [ -f "$ASAN_RT" ]; then
-            export LD_PRELOAD="$ASAN_RT${LD_PRELOAD:+:$LD_PRELOAD}"
-          fi
-          export ASAN_OPTIONS="${ASAN_OPTIONS:-detect_leaks=0:halt_on_error=1:abort_on_error=1:disable_coredump=0:print_summary=1:symbolize=0}"
-
-          exec "$HERE/d8" "$@"
-          EOF
-          chmod 0755 "$RUNTIME_DIR/run-asan-d8.sh"
-
-          cat > "$SYMBOLS_DIR/symbolize-log.sh" <<'EOF'
-          #!/usr/bin/env bash
-          set -euo pipefail
-
-          HERE="$(cd -- "$(dirname -- "$0")" && pwd)"
-          if [[ $# -ne 1 ]]; then
-            echo "Usage: $0 <android-asan-log.txt>" >&2
-            exit 2
-          fi
-
-          export ASAN_SYMBOLIZER_PATH="$HERE/tools/llvm-symbolizer"
-          if [[ -x "$HERE/tools/asan_symbolize.py" ]]; then
-            python3 "$HERE/tools/asan_symbolize.py" \
-              --output-directory "$HERE/out" < "$1"
-          else
-            echo "asan_symbolize.py was not packaged; use llvm-symbolizer manually." >&2
-            exit 1
-          fi
-          EOF
-          chmod 0755 "$SYMBOLS_DIR/symbolize-log.sh"
-
-          {
-            echo "V8 Android ARM64 classic ASan Sandbox PoC build"
-            echo "V8 commit: $V8_COMMIT"
-            echo "V8 ref requested: $V8_REF"
-            echo "GitHub run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
-            echo "Runner: $RUNNER_NAME"
-            echo "Runner OS: $RUNNER_OS $RUNNER_ARCH"
-            echo "Build jobs: $BUILD_JOBS"
-            echo "Sanitizer: classic AddressSanitizer (is_asan=true)"
-            echo "Important: Chromium currently marks classic Android ASan unsupported and recommends HWASan."
-            echo
-            file "$OUT_DIR/d8"
-            readelf -l "$OUT_DIR/d8" | grep -F 'Requesting program interpreter' || true
-            readelf -d "$OUT_DIR/d8" | grep -F '(NEEDED)' || true
-          } > "$RUNTIME_DIR/BUILD_INFO.txt"
-
-          cat > "$RUNTIME_DIR/README-RUN.txt" <<'EOF'
-          This is an Android/Bionic ARM64 classic-ASan d8 build.
-
-          Basic check:
-            chmod +x d8 run-asan-d8.sh run-asan-poc.sh
-            ./run-asan-d8.sh --version
-            ./run-asan-poc.sh verify-sandbox.js
-
-          PoC run:
-            ./run-asan-poc.sh poc.js >poc.stdout.txt 2>poc.stderr.txt
-
-          Keep --sandbox-prohibit-insecure-mode enabled for a security claim.
-          Do not treat a result requiring --no-sandbox-prohibit-insecure-mode as
-          evidence of a production Android V8 sandbox escape.
-
-          Classic Android ASan is currently unsupported upstream. If the runtime
-          fails before V8 starts, use an older matching V8 revision or build an
-          Android ARM64 HWASan variant on a compatible Android environment.
-          EOF
-
-          (
-            cd "$RUNTIME_DIR"
-            find . -type f -print0 | sort -z | xargs -0 sha256sum \
-              > SHA256SUMS.txt
-          )
-          (
-            cd "$SYMBOLS_DIR"
-            find . -type f -print0 | sort -z | xargs -0 sha256sum \
-              > SHA256SUMS.txt
-          )
-
-          cd "$PACKAGE_ROOT"
-          tar --zstd -cf \
-            "$GITHUB_WORKSPACE/v8-android-arm64-sandbox-asan-${V8_SHORT_SHA}.tar.zst" \
-            "$(basename "$RUNTIME_DIR")"
-          tar --zstd -cf \
-            "$GITHUB_WORKSPACE/v8-android-arm64-sandbox-asan-symbols-${V8_SHORT_SHA}.tar.zst" \
-            "$(basename "$SYMBOLS_DIR")"
-
-          cd "$GITHUB_WORKSPACE"
-          sha256sum \
-            "v8-android-arm64-sandbox-asan-${V8_SHORT_SHA}.tar.zst" \
-            "v8-android-arm64-sandbox-asan-symbols-${V8_SHORT_SHA}.tar.zst" \
-            > ARTIFACT_SHA256SUMS.txt
-
-          ls -lh *.tar.zst ARTIFACT_SHA256SUMS.txt
-
-      - name: Upload ASan d8 artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: v8-android-arm64-sandbox-asan-${{ env.V8_SHORT_SHA }}
-          path: |
-            v8-android-arm64-sandbox-asan-${{ env.V8_SHORT_SHA }}.tar.zst
-            v8-android-arm64-sandbox-asan-symbols-${{ env.V8_SHORT_SHA }}.tar.zst
-            ARTIFACT_SHA256SUMS.txt
-          if-no-files-found: error
-          compression-level: 0
-          retention-days: 14
-
-      - name: Write job summary
+      - name: Collect build files safely
         shell: bash
         run: |
-          {
-            echo "## V8 Android ARM64 classic ASan sandbox PoC build"
-            echo
-            echo "- Commit: \`$V8_COMMIT\`"
-            echo "- Requested ref: \`$V8_REF\`"
-            echo "- Target: \`android/arm64\`"
-            echo "- Sanitizer: \`is_asan=true\`"
-            echo "- Sandbox: enabled"
-            echo "- Memory corruption API: enabled"
-            echo "- DCHECK always on: disabled"
-            echo "- Build jobs: \`$BUILD_JOBS\`"
-            echo "- Artifact: \`v8-android-arm64-sandbox-asan-$V8_SHORT_SHA\`"
-            echo
-            echo "> Chromium currently warns that classic Android ASan is unsupported and recommends HWASan on ARM64."
-            echo
-            echo "The binary targets Android/Bionic and cannot execute directly on the x64 GitHub runner."
-          } >> "$GITHUB_STEP_SUMMARY"
-          
+          set -euxo pipefail
+
+          PKG="package/${{ matrix.name }}"
+          PREFIX="$PWD/out/${{ matrix.name }}"
+
+          mkdir -p "$PKG/bin" "$PKG/lib" "$PKG/include" "$PKG/build-info" "$PKG/src-snippets"
+
+          copy_if_exists() {
+            SRC="$1"
+            DST="$2"
+
+            if [ -e "$SRC" ]; then
+              cp -a "$SRC" "$DST"
+              echo "[copy] $SRC -> $DST"
+            else
+              echo "[skip] missing: $SRC"
+            fi
+          }
+
+          copy_dir_if_exists() {
+            SRC="$1"
+            DST="$2"
+
+            if [ -d "$SRC" ]; then
+              mkdir -p "$DST"
+              cp -a "$SRC/." "$DST/" || true
+              echo "[copy-dir] $SRC -> $DST"
+            else
+              echo "[skip-dir] missing: $SRC"
+            fi
+          }
+
+          copy_if_exists "ffmpeg/ffmpeg" "$PKG/bin/"
+          copy_if_exists "ffmpeg/ffprobe" "$PKG/bin/"
+          copy_if_exists "ffmpeg/ffplay" "$PKG/bin/"
+          copy_if_exists "ffmpeg/tests/videogen" "$PKG/bin/"
+          copy_if_exists "ffmpeg/tools/target_dem_fuzzer" "$PKG/bin/"
+
+          copy_if_exists "$PREFIX/bin/ffmpeg" "$PKG/bin/"
+          copy_if_exists "$PREFIX/bin/ffprobe" "$PKG/bin/"
+          copy_if_exists "$PREFIX/bin/ffplay" "$PKG/bin/"
+
+          copy_dir_if_exists "$PREFIX/lib" "$PKG/lib"
+          copy_dir_if_exists "$PREFIX/include" "$PKG/include"
+
+          for lib in \
+            ffmpeg/libavutil/libavutil.a \
+            ffmpeg/libavcodec/libavcodec.a \
+            ffmpeg/libavformat/libavformat.a \
+            ffmpeg/libavdevice/libavdevice.a \
+            ffmpeg/libavfilter/libavfilter.a \
+            ffmpeg/libswscale/libswscale.a \
+            ffmpeg/libswresample/libswresample.a
+          do
+            copy_if_exists "$lib" "$PKG/lib/"
+          done
+
+          copy_if_exists "ffmpeg/config.h" "$PKG/build-info/"
+          copy_if_exists "ffmpeg/config.log" "$PKG/build-info/"
+          copy_if_exists "ffmpeg/ffbuild/config.log" "$PKG/build-info/"
+          copy_if_exists "ffmpeg/ffbuild/config.mak" "$PKG/build-info/"
+          copy_if_exists "ffmpeg/ffbuild/config.sh" "$PKG/build-info/"
+          copy_if_exists "FFMPEG_COMMIT.txt" "$PKG/build-info/"
+
+          for src in \
+            ffmpeg/libavformat/http.c \
+            ffmpeg/libavformat/rtsp.c \
+            ffmpeg/libavformat/mov.c \
+            ffmpeg/libavformat/concatdec.c \
+            ffmpeg/libavformat/id3v2.c \
+            ffmpeg/libavformat/omadec.c \
+            ffmpeg/libavformat/matroskadec.c \
+            ffmpeg/libavutil/rc4.c \
+            ffmpeg/libavutil/blowfish.c \
+            ffmpeg/libavutil/aes_ctr.c \
+            ffmpeg/tests/videogen.c \
+            ffmpeg/tests/utils.c
+          do
+            copy_if_exists "$src" "$PKG/src-snippets/"
+          done
+
+          cat > "$PKG/RUN_ENV.sh" <<'EOF'
+          #!/usr/bin/env bash
+          HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+          export LD_LIBRARY_PATH="$HERE/lib:${LD_LIBRARY_PATH:-}"
+          export ASAN_OPTIONS=detect_leaks=0:abort_on_error=1:halt_on_error=1:symbolize=1:allocator_may_return_null=1
+          export UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1
+          export PATH="$HERE/bin:$PATH"
+          EOF
+
+          chmod +x "$PKG/RUN_ENV.sh"
+
+          cat > "$PKG/README_RUN.txt" <<EOF
+          Build: ${{ matrix.name }}
+          Commit: $(cat FFMPEG_COMMIT.txt 2>/dev/null || echo unknown)
+
+          Usage:
+            cd ${{ matrix.name }}
+            source ./RUN_ENV.sh
+            ./bin/ffmpeg -version
+            ./bin/ffprobe -version
+
+          Common tests:
+            ./bin/ffprobe -v trace poc.oma
+            ./bin/ffprobe -v trace matroska_nan.mkv
+            ./bin/ffprobe -v error cmov_oom.mp4
+            ./bin/videogen /tmp/out.yuv 65536 65536
+          EOF
+
+          echo "[+] Packaged files:"
+          find "$PKG" -maxdepth 4 -type f | sort
+
+          echo "[+] Binary file info:"
+          find "$PKG/bin" -maxdepth 1 -type f -exec file {} \; || true
+
+      - name: Zip build
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          ZIP="ffmpeg-${{ matrix.name }}-x64-linux.zip"
+
+          cd package
+          zip -r "../$ZIP" "${{ matrix.name }}"
+          cd ..
+
+          sha256sum "$ZIP" | tee "$ZIP.sha256"
+          ls -lh "$ZIP" "$ZIP.sha256"
+
+      - name: Upload to sendit.sh
+        shell: bash
+        continue-on-error: true
+        run: |
+          set -uxo pipefail
+
+          ZIP="ffmpeg-${{ matrix.name }}-x64-linux.zip"
+          LINK_FILE="ffmpeg-${{ matrix.name }}-sendit-link.txt"
+
+          echo "[+] Uploading $ZIP to sendit.sh"
+
+          LINK=""
+
+          for i in 1 2 3 4 5; do
+            echo "[+] Upload attempt $i"
+
+            LINK="$(curl -fsS --retry 3 --retry-all-errors -T "$ZIP" https://sendit.sh || true)"
+
+            if echo "$LINK" | grep -Eiq 'https?://'; then
+              echo "[OK] Upload succeeded"
+              break
+            fi
+
+            echo "[WARN] Upload failed or no link returned. Response:"
+            echo "$LINK"
+            sleep 10
+          done
+
+          if ! echo "$LINK" | grep -Eiq 'https?://'; then
+            echo "[WARN] sendit upload failed after retries"
+            LINK="SENDIT_UPLOAD_FAILED_USE_GITHUB_ARTIFACT"
+          fi
+
+          echo "Download link for ${{ matrix.name }}:"
+          echo "$LINK"
+          echo "$LINK" > "$LINK_FILE"
+
+      - name: Upload GitHub artifact backup
+        uses: actions/upload-artifact@v4
+        with:
+          name: ffmpeg-${{ matrix.name }}-x64-linux
+          if-no-files-found: error
+          retention-days: 7
+          path: |
+            ffmpeg-${{ matrix.name }}-x64-linux.zip
+            ffmpeg-${{ matrix.name }}-x64-linux.zip.sha256
+            ffmpeg-${{ matrix.name }}-sendit-link.txt
